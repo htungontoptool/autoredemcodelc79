@@ -15,6 +15,7 @@ import re
 import io
 import statistics
 import asyncio
+import sys
 from flask import Flask
 from collections import deque, defaultdict
 from datetime import datetime, timedelta
@@ -26,7 +27,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "LC79 BOT ONLINE"
+    return "LC79 BOT ONLINE (Check Render Logs for Bot Status)"
 
 @app.route("/health")
 def health():
@@ -43,23 +44,44 @@ logging.getLogger('engineio').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 logging.getLogger('telethon').setLevel(logging.WARNING)
 
-# ========================= CONFIG =========================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+# ========================= CONFIG & BOT INIT =========================
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "@admin")
 TELETHON_API_ID = int(os.environ.get("TELETHON_API_ID", "0"))
-TELETHON_API_HASH = os.environ.get("TELETHON_API_HASH", "")
+TELETHON_API_HASH = os.environ.get("TELETHON_API_HASH", "").strip()
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-bot = telebot.TeleBot(BOT_TOKEN)
-bot.set_my_commands([
-    telebot.types.BotCommand("/start", "Menu chính"),
-    telebot.types.BotCommand("/login", "Login game"),
-    telebot.types.BotCommand("/stop", "Ngắt kết nối"),
-    telebot.types.BotCommand("/nhapkey", "Nhập key VIP"),
-    telebot.types.BotCommand("/huongdan", "Hướng dẫn"),
-])
+bot = None
+if not BOT_TOKEN or ":" not in BOT_TOKEN:
+    logger.error("❌ LỖI: BOT_TOKEN chưa có hoặc sai định dạng. Vào Render -> Environment để thêm BOT_TOKEN (lấy từ @BotFather)!")
+else:
+    try:
+        bot = telebot.TeleBot(BOT_TOKEN)
+        bot.set_my_commands([
+            telebot.types.BotCommand("/start", "Menu chính"),
+            telebot.types.BotCommand("/login", "Login game"),
+            telebot.types.BotCommand("/stop", "Ngắt kết nối"),
+            telebot.types.BotCommand("/nhapkey", "Nhập key VIP"),
+            telebot.types.BotCommand("/huongdan", "Hướng dẫn"),
+        ])
+        logger.info("✅ Kết nối Telegram Bot OK!")
+    except Exception as e:
+        logger.error(f"❌ LỖI TOKEN TELEGRAM: {e}. Hãy kiểm tra lại BOT_TOKEN trên Render!")
+        bot = None
+
+if not bot:
+    logger.error("🚨 BOT CHƯA SẴN SÀNG. Vui lòng sửa BOT_TOKEN trên Render Environment Variables và Restart.")
+    # Tạo bot giả để code không lỗi, tránh bị sập Render
+    class DummyBot:
+        def __init__(self): pass
+        def __getattr__(self, name):
+            def dummy(*args, **kwargs):
+                def dummy_wrapper(*args, **kwargs): pass
+                return dummy_wrapper
+            return dummy
+    bot = DummyBot()
 
 HISTORY_API_URL = "https://wtxmd52.tele68.com/v1/txmd5/sessions"
 API_URL_FALLBACK = "https://living-telecommunications-start-consoles.trycloudflare.com/api/txmd5"
@@ -1315,9 +1337,15 @@ if __name__ == "__main__":
         threading.Thread(target=_start_telethon_listener, daemon=True).start()
     logger.info("LC79 ELITE ULTRA - READY")
     logger.info(f"Tele: {'OK' if TELETHON_API_ID else 'MISSING'} | Redeem: {len(REDEEM_ACCOUNTS)} acc | Game: {len(game_accounts)} accs | Data: {DATA_DIR}")
-    while True:
-        try:
-            bot.infinity_polling(timeout=20, long_polling_timeout=30)
-        except Exception as e:
-            logger.error(f"Bot crashed: {e}")
-            time.sleep(5)
+    
+    if bot:
+        while True:
+            try:
+                bot.infinity_polling(timeout=20, long_polling_timeout=30)
+            except Exception as e:
+                logger.error(f"Bot crashed: {e}")
+                time.sleep(5)
+    else:
+        logger.error("Bot không chạy do lỗi TOKEN. Hãy sửa BOT_TOKEN và Restart!")
+        while True:
+            time.sleep(60) # Giữ Render không bị sập
