@@ -1,24 +1,20 @@
 services:
   - type: web
-    name: autoreedem-bot
+    name: lc79-bot
     runtime: python
     plan: free
-    region: singapore
-    branch: main
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: python autoreedem.py
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
     envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: ADMIN_USERNAME
+        sync: false
+      - key: TELETHON_API_ID
+        sync: false
+      - key: TELETHON_API_HASH
+        sync: false
       - key: PYTHON_VERSION
-        value: "3.11.9"
-      - key: TG_API_ID
-        value: "36655605"
-      - key: TG_API_HASH
-        value: "98ac382a42aca5e63d0578a9a4e52c8c"
-      - key: TG_SESSION_STRING
-        sync: false          # nhập tay trên Render dashboard
-      - key: ACCOUNTS_JSON
-        sync: false          # nhập tay trên Render dashboard
-      - key: DATA_DIR
-        value: "./data"
-    healthCheckPath: /
-    autoDeploy: true
+        value: 3.11.6
