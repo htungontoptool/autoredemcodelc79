@@ -1,29 +1,9 @@
-# === BẢO MẬT — KHÔNG BAO GIỜ COMMIT ===
-gen_session.py
-*.session
-*.session-journal
-tokens.txt
-history.json
-accounts.json
-.env
-.env.*
-data/
-
-# === Python ===
 __pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-venv/
-env/
-.pytest_cache/
-
-# === IDE ===
-.vscode/
-.idea/
-*.swp
-.DS_Store
-
-# === Log ===
-*.log
-logs/
+*.pyc
+*.pyo
+.env
+*.json
+*.txt
+!.gitignore
+!requirements.txt
+!runtime.txt
