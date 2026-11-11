@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: autoreedem-bot
+    runtime: python
+    plan: free
+    region: singapore
+    branch: main
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python autoreedem.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: TG_API_ID
+        value: "36655605"
+      - key: TG_API_HASH
+        value: "98ac382a42aca5e63d0578a9a4e52c8c"
+      - key: TG_SESSION_STRING
+        sync: false          # nhập tay trên Render dashboard
+      - key: ACCOUNTS_JSON
+        sync: false          # nhập tay trên Render dashboard
+      - key: DATA_DIR
+        value: "./data"
+    healthCheckPath: /
+    autoDeploy: true
