@@ -105,7 +105,6 @@ def md5_hash(t):
     return hashlib.md5(t.encode()).hexdigest()
 
 def normalize_pw(pw, force_mode=None):
-    """Password thường -> MD5. Nếu force_mode='md5'/'plain' thì ép kiểu."""
     pw = pw.strip()
     if force_mode == "md5":
         return pw.lower()
@@ -813,6 +812,7 @@ def cmd_start(m):
 
 @bot.callback_query_handler(func=lambda c: True)
 def cb(c):
+    global redeem_logs, game_accounts, REDEEM_ACCOUNTS
     cid = c.message.chat.id; init_user_state(cid); st = user_states[cid]
     data = c.data
     try: bot.answer_callback_query(c.id)
@@ -882,7 +882,6 @@ def cb(c):
         send_redeem_log_file(cid)
     elif data == "rd_clearlog":
         if cid != ADMIN_ID: return
-        global redeem_logs
         redeem_logs = []; save_json(REDEEM_LOGS_FILE, redeem_logs)
         bot.send_message(cid, "Da xoa log", reply_markup=redeem_menu())
     elif data == "rd_refresh":
@@ -905,7 +904,6 @@ def cb(c):
         send_game_accounts_file(cid)
     elif data == "ga_clear":
         if cid != ADMIN_ID: return
-        global game_accounts
         game_accounts = {}; save_json(GAME_ACCOUNTS_FILE, game_accounts)
         bot.send_message(cid, "Da xoa DS game accounts", reply_markup=gameaccs_menu())
 
@@ -1038,6 +1036,7 @@ def lk(m):
 @bot.message_handler(commands=['addacc'])
 @require_admin
 def add_acc(m):
+    global REDEEM_ACCOUNTS
     p = m.text.split()
     if len(p) < 4:
         return bot.reply_to(m, "CU PHAP:\n<code>/addacc USERNAME PASSWORD NICKNAME</code>\n\nPass thuong - bot tu MD5\nFlag --md5 neu da co MD5\nFlag --plain neu 32hex nhung la pass thuong", parse_mode="HTML")
@@ -1053,7 +1052,6 @@ def add_acc(m):
     hashed = normalize_pw(pw, force_mode)
     redeem_state["accounts"].append({"un": un, "pw": hashed, "nick": nick})
     save_json(REDEEM_STATE_FILE, redeem_state)
-    global REDEEM_ACCOUNTS
     REDEEM_ACCOUNTS = build_redeem_accounts()
     mode_txt = f" [{force_mode}]" if force_mode else ""
     bot.reply_to(m, f"DA THEM{mode_txt}\nNick: <b>{nick}</b>\nUser: <code>{un}</code>\nHash: <code>{hashed[:20]}...</code>\nTong: {len(REDEEM_ACCOUNTS)}", parse_mode="HTML")
@@ -1061,6 +1059,7 @@ def add_acc(m):
 @bot.message_handler(commands=['delacc'])
 @require_admin
 def del_acc(m):
+    global REDEEM_ACCOUNTS
     p = m.text.split(maxsplit=1)
     if len(p) < 2: return bot.reply_to(m, "/delacc NICK")
     nick = p[1].strip()
@@ -1068,7 +1067,6 @@ def del_acc(m):
     redeem_state["accounts"] = [a for a in redeem_state["accounts"] if a["nick"] != nick]
     if len(redeem_state["accounts"]) == before: return bot.reply_to(m, f"Khong tim thay {nick}")
     save_json(REDEEM_STATE_FILE, redeem_state)
-    global REDEEM_ACCOUNTS
     REDEEM_ACCOUNTS = build_redeem_accounts()
     bot.reply_to(m, f"Da xoa {nick} | Con: {len(REDEEM_ACCOUNTS)}")
 
