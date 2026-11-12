@@ -562,7 +562,7 @@ def cmd_start(m):
 
 @bot.callback_query_handler(func=lambda c: True)
 def cb(c):
-    global redeem_logs, game_accounts, REDEEM_ACCOUNTS
+    global redeem_logs, game_accounts, REDEEM_ACCOUNTS, tele_ready, tele_client, tele_loop
     cid, data = c.message.chat.id, c.data
     try: bot.answer_callback_query(c.id)
     except Exception: pass
@@ -774,7 +774,6 @@ def cb(c):
     if data == "tele_logout_yes":
         if cid != ADMIN_ID: return go("⛔ Chỉ admin.", admin_menu())
         if os.path.exists(TELE_SESSION_FILE): os.remove(TELE_SESSION_FILE)
-        global tele_ready
         tele_ready = False
         if tele_client is not None:
             try:
