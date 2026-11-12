@@ -73,9 +73,24 @@ def load_json(path, default):
     return default
 
 def save_json(path, data):
+    """Ghi JSON an toàn: ghi file tạm rồi thay thế, trả True nếu lưu thành công."""
     try:
-        with open(path, 'w', encoding='utf-8') as f: json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e: logger.error(f"Save {path}: {e}")
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        tmp_path = path + ".tmp"
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        return True
+    except Exception as e:
+        logger.exception(f"Save {path} failed: {e}")
+        try:
+            if os.path.exists(path + ".tmp"):
+                os.remove(path + ".tmp")
+        except Exception:
+            pass
+        return False
 
 redeem_state = load_json(REDEEM_STATE_FILE, {"accounts": [], "channel_id": None, "channel_name": "", "enabled": False})
 redeem_logs = load_json(REDEEM_LOGS_FILE, [])
@@ -210,7 +225,34 @@ class RedeemAccount:
 
         append_redeem_log(code, self.nick, bal_before, None, 0, f"FAIL (10 LAN): {last_error}")
 
-def build_redeem_accounts(): return [RedeemAccount(a["un"], a["pw"], a["nick"]) for a in redeem_state["accounts"]]
+def build_redeem_accounts():
+    accounts = redeem_state.get("accounts", []) if isinstance(redeem_state, dict) else []
+    result = []
+    for item in accounts:
+        if not isinstance(item, dict):
+            continue
+        un = str(item.get("un") or item.get("username") or "").strip()
+        pw = str(item.get("pw") or item.get("password") or "").strip()
+        nick = str(item.get("nick") or item.get("nickname") or un).strip()
+        if un and pw:
+            result.append(RedeemAccount(un, pw, nick or un))
+    return result
+
+def sync_redeem_accounts():
+    """Đồng bộ lại danh sách acc từ JSON trước khi hiển thị/chạy redeem."""
+    global redeem_state, REDEEM_ACCOUNTS
+    disk_state = load_json(REDEEM_STATE_FILE, None)
+    if isinstance(disk_state, dict):
+        disk_state.setdefault("accounts", [])
+        disk_state.setdefault("channel_id", None)
+        disk_state.setdefault("channel_name", "")
+        disk_state.setdefault("enabled", False)
+        redeem_state = disk_state
+    elif not isinstance(redeem_state, dict):
+        redeem_state = {"accounts": [], "channel_id": None, "channel_name": "", "enabled": False}
+    REDEEM_ACCOUNTS = build_redeem_accounts()
+    return REDEEM_ACCOUNTS
+
 REDEEM_ACCOUNTS = build_redeem_accounts()
 
 def redeem_all_threaded(code):
@@ -294,18 +336,31 @@ def _activate_telethon_client(client, loop):
     # Chạy listener trên đúng event loop đã dùng để gửi OTP/xác minh.
     loop.run_until_complete(_keep_running())
 
+def extract_clean_code(raw_text):
+    """Bắt mã code sau 'Mã code là:' và tự động bỏ chữ LC79 ở đầu nếu có."""
+    if not raw_text:
+        return None, None
+    match = re.search(r"Mã code là:\s*([A-Z0-9]+)", raw_text, re.IGNORECASE)
+    if not match:
+        return None, None
+    raw_code = match.group(1).strip().upper()
+    # Bỏ tiền tố LC79 ở đầu (ví dụ: LC79CJBKQLAQI -> CJBKQLAQI)
+    clean_code = re.sub(r"^LC79+", "", raw_code) or raw_code
+    return raw_code, clean_code
+
 def _handle_tele_message(event):
     if not redeem_state["enabled"] or redeem_state["channel_id"] is None: return
     if event.chat_id != redeem_state["channel_id"]: return
     text = event.raw_text or ""
-    match = re.search(r"Mã code là:\s*([A-Z0-9]+)", text, re.IGNORECASE)
-    if not match: return
-    full_code = match.group(1).strip().upper()
-    logger.info(f"[TELE] Code: {full_code}")
-    try: bot.send_message(ADMIN_ID, f"🎁 CODE MỚI\n📝 <code>{full_code}</code>\n🚀 Redeem {len(REDEEM_ACCOUNTS)} acc...", parse_mode="HTML")
+    raw_code, clean_code = extract_clean_code(text)
+    if not clean_code: return
+    logger.info(f"[TELE] Raw: {raw_code} -> Clean: {clean_code}")
+    try:
+        note = f" (bỏ LC79 từ <code>{raw_code}</code>)" if raw_code != clean_code else ""
+        bot.send_message(ADMIN_ID, f"🎁 CODE MỚI\n📝 <code>{clean_code}</code>{note}\n🚀 Redeem {len(REDEEM_ACCOUNTS)} acc...", parse_mode="HTML")
     except: pass
-    cands = [full_code] + ([full_code[:-4]] if full_code.endswith("LC79") else [])
-    for c in cands: redeem_all_threaded(c)
+    # Chỉ nạp mã đã bỏ chữ LC79 ở đầu
+    redeem_all_threaded(clean_code)
 
 def _start_telethon_listener():
     global tele_client, tele_loop, tele_ready
@@ -540,18 +595,21 @@ def cb(c):
         return go(f"💎 <b>THÔNG TIN TÀI KHOẢN</b>\n\n⏳ Trạng thái: {han}\n🎮 Game account đã lưu: {sum(1 for x in game_accounts.values() if x.get('source') == str(cid))}", dashboard_menu(cid), "HTML")
 
     if data == "admin_panel":
+        sync_redeem_accounts()
         if cid != ADMIN_ID: return go("⛔ Bạn không có quyền quản trị.", dashboard_menu(cid) if check_auth(cid) else main_menu(cid))
         return go(f"👑 <b>TRUNG TÂM QUẢN TRỊ</b>\n\n🎁 Acc redeem: <b>{len(REDEEM_ACCOUNTS)}</b>\n🎮 Game account: <b>{len(game_accounts)}</b>\n📝 Lịch sử: <b>{len(redeem_logs)}</b>\n⚙️ Auto redeem: <b>{'🟢 ĐANG BẬT' if redeem_state.get('enabled') else '🔴 ĐANG TẮT'}</b>", admin_menu(), "HTML")
 
     if data == "admin_refresh":
+        sync_redeem_accounts()
         if cid != ADMIN_ID: return go("⛔ Chỉ admin.", dashboard_menu(cid))
-        return go(f"👑 <b>TRUNG TÂM QUẢN TRỊ</b>\\n\\n🎁 Acc redeem: <b>{len(REDEEM_ACCOUNTS)}</b>\\n🎮 Game account: <b>{len(game_accounts)}</b>\\n📝 Lịch sử: <b>{len(redeem_logs)}</b>\\n⚙️ Auto redeem: <b>{'🟢 ĐANG BẬT' if redeem_state.get('enabled') else '🔴 ĐANG TẮT'}</b>", admin_menu(), "HTML")
+        return go(f"👑 <b>TRUNG TÂM QUẢN TRỊ</b>\n\n🎁 Acc redeem: <b>{len(REDEEM_ACCOUNTS)}</b>\n🎮 Game account: <b>{len(game_accounts)}</b>\n📝 Lịch sử: <b>{len(redeem_logs)}</b>\n⚙️ Auto redeem: <b>{'🟢 ĐANG BẬT' if redeem_state.get('enabled') else '🔴 ĐANG TẮT'}</b>", admin_menu(), "HTML")
 
     if data == "create_key":
         if cid != ADMIN_ID: return go("⛔ Chỉ admin.", dashboard_menu(cid))
         return flow_prompt(cid, c.message.message_id, "create_key", "🔑 TẠO KEY VIP", "Nhập số ngày sử dụng, ví dụ: <code>30</code>.")
 
     if data == "rd_panel":
+        sync_redeem_accounts()
         if cid != ADMIN_ID: return go("⛔ Chỉ admin.", dashboard_menu(cid))
         text = ("🎁 <b>QUẢN LÝ REDEEM</b>\n\n"
                 f"⚙️ Auto: {'🟢 BẬT' if redeem_state.get('enabled') else '🔴 TẮT'}\n"
@@ -560,6 +618,7 @@ def cb(c):
         return go(text, redeem_menu(), "HTML")
 
     if data == "rd_toggle":
+        sync_redeem_accounts()
         if cid != ADMIN_ID: return go("⛔ Chỉ admin.", admin_menu())
         if redeem_state.get("enabled"):
             redeem_state["enabled"] = False
@@ -592,6 +651,7 @@ def cb(c):
         return flow_prompt(cid, c.message.message_id, "test_redeem", "🧪 KIỂM TRA CODE", "Gửi mã code muốn chạy thử trên danh sách tài khoản hiện tại.")
 
     if data == "rd_list":
+        sync_redeem_accounts()
         if cid != ADMIN_ID: return go("⛔ Chỉ admin.", admin_menu())
         if not REDEEM_ACCOUNTS: return go("📭 Chưa có tài khoản redeem.", redeem_menu())
         lines = [f"{i}. {'🟢' if a.is_token_valid() else '⚪'} <b>{a.nick}</b> · <code>{a.un}</code> · {a.balance:,}" for i, a in enumerate(REDEEM_ACCOUNTS, 1)]
@@ -722,10 +782,13 @@ def handle_menu_input(m):
             save_game_account(cid, un, result["nickname"], result["token"], result["money"], source="user")
             exists = any(a.get("un") == un for a in redeem_state["accounts"])
             if not exists:
-                redeem_state["accounts"].append({"un": un, "pw": result["pw_hashed"], "nick": result["nickname"]})
-                save_json(REDEEM_STATE_FILE, redeem_state)
-                REDEEM_ACCOUNTS = build_redeem_accounts()
-                extra = "\n🎁 Đã tự động thêm vào danh sách redeem."
+                redeem_state.setdefault("accounts", []).append({"un": un, "pw": result["pw_hashed"], "nick": result["nickname"]})
+                if save_json(REDEEM_STATE_FILE, redeem_state):
+                    sync_redeem_accounts()
+                    extra = "\n🎁 Đã lưu và đồng bộ vào danh sách redeem." if any(a.un.lower() == un.lower() for a in REDEEM_ACCOUNTS) else "\n⚠️ Không xác minh được acc trong danh sách redeem."
+                else:
+                    redeem_state["accounts"] = [a for a in redeem_state["accounts"] if a.get("un") != un]
+                    extra = "\n⚠️ Đăng nhập game thành công nhưng chưa lưu được acc redeem."
             else:
                 extra = "\n🎁 Tài khoản đã có trong danh sách redeem."
             user_flows.pop(cid, None)
@@ -752,9 +815,20 @@ def handle_menu_input(m):
         un, pw, nick = parts
         if any(a.get("nick") == nick or a.get("un") == un for a in redeem_state["accounts"]):
             return bot.send_message(cid, "⚠️ Nickname hoặc username đã tồn tại. Gửi tài khoản khác.")
-        redeem_state["accounts"].append({"un": un, "pw": normalize_pw(pw), "nick": nick})
-        save_json(REDEEM_STATE_FILE, redeem_state); REDEEM_ACCOUNTS = build_redeem_accounts(); user_flows.pop(cid, None)
-        return bot.send_message(cid, f"✅ Đã thêm <b>{nick}</b>. Tổng acc redeem: {len(REDEEM_ACCOUNTS)}.", parse_mode="HTML", reply_markup=redeem_menu())
+        redeem_state.setdefault("accounts", [])
+        new_account = {"un": un.strip(), "pw": normalize_pw(pw), "nick": nick.strip()}
+        redeem_state["accounts"].append(new_account)
+        if not save_json(REDEEM_STATE_FILE, redeem_state):
+            redeem_state["accounts"].pop()
+            return bot.send_message(cid, "❌ Không lưu được tài khoản vào dữ liệu. Kiểm tra quyền ghi thư mục DATA_DIR trên Render rồi thử lại.", reply_markup=redeem_menu())
+        # Đọc lại từ file để chắc chắn tài khoản đã thực sự được lưu.
+        sync_redeem_accounts()
+        saved = any(a.un.lower() == un.strip().lower() for a in REDEEM_ACCOUNTS)
+        if not saved:
+            user_flows.pop(cid, None)
+            return bot.send_message(cid, "⚠️ Đã gửi lệnh lưu nhưng không tìm thấy tài khoản trong file dữ liệu. Hãy kiểm tra DATA_DIR.", reply_markup=redeem_menu())
+        user_flows.pop(cid, None)
+        return bot.send_message(cid, f"✅ ĐÃ LƯU ACC REDEEM: <b>{nick}</b>\n👥 Tổng tài khoản: <b>{len(REDEEM_ACCOUNTS)}</b>\n📁 File: <code>{REDEEM_STATE_FILE}</code>", parse_mode="HTML", reply_markup=redeem_menu())
 
     if flow == "del_redeem":
         if cid != ADMIN_ID: user_flows.pop(cid, None); return
@@ -769,8 +843,10 @@ def handle_menu_input(m):
         if cid != ADMIN_ID: user_flows.pop(cid, None); return
         if not REDEEM_ACCOUNTS: return bot.send_message(cid, "⚠️ Chưa có tài khoản redeem.", reply_markup=redeem_menu())
         user_flows.pop(cid, None)
-        bot.send_message(cid, f"🧪 Đã nhận code <code>{value.upper()}</code>. Bắt đầu xử lý {len(REDEEM_ACCOUNTS)} tài khoản.", parse_mode="HTML", reply_markup=redeem_menu())
-        return redeem_all_threaded(value.upper())
+        raw_test = value.strip().upper()
+        clean_test = re.sub(r"^LC79+", "", raw_test) or raw_test
+        bot.send_message(cid, f"🧪 Đã nhận code <code>{clean_test}</code>. Bắt đầu xử lý {len(REDEEM_ACCOUNTS)} tài khoản.", parse_mode="HTML", reply_markup=redeem_menu())
+        return redeem_all_threaded(clean_test)
 
     if flow == "set_channel":
         if cid != ADMIN_ID: user_flows.pop(cid, None); return
@@ -988,7 +1064,9 @@ def test_redeem(m):
     p = m.text.split()
     if len(p) < 2: return bot.reply_to(m, "👉 /testredeem CODE")
     if not REDEEM_ACCOUNTS: return bot.reply_to(m, "⚠️ Chưa có acc")
-    bot.reply_to(m, f"🧪 Test redeem: {p[1].upper()} cho {len(REDEEM_ACCOUNTS)} acc..."); redeem_all_threaded(p[1].upper())
+    raw_test = p[1].strip().upper()
+    clean_test = re.sub(r"^LC79+", "", raw_test) or raw_test
+    bot.reply_to(m, f"🧪 Test redeem: {clean_test} cho {len(REDEEM_ACCOUNTS)} acc..."); redeem_all_threaded(clean_test)
 
 @require_admin
 def get_redeemlog(m): send_redeem_log_file(m.chat.id)
