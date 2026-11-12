@@ -63,7 +63,6 @@ authorized_users = {}
 REDEEM_STATE_FILE = os.path.join(DATA_DIR, "redeem_state.json")
 REDEEM_LOGS_FILE = os.path.join(DATA_DIR, "redeem_logs.json")
 GAME_ACCOUNTS_FILE = os.path.join(DATA_DIR, "game_accounts.json")
-USER_PROFILES_FILE = os.path.join(DATA_DIR, "user_profiles.json")
 TELE_SESSION_FILE = os.path.join(DATA_DIR, "tele_session.txt")
 
 def load_json(path, default):
@@ -81,7 +80,6 @@ def save_json(path, data):
 redeem_state = load_json(REDEEM_STATE_FILE, {"accounts": [], "channel_id": None, "channel_name": "", "enabled": False})
 redeem_logs = load_json(REDEEM_LOGS_FILE, [])
 game_accounts = load_json(GAME_ACCOUNTS_FILE, {})
-user_profiles = load_json(USER_PROFILES_FILE, {})
 
 def md5_hash(t): return hashlib.md5(t.encode()).hexdigest()
 def normalize_pw(pw, force_mode=None):
@@ -100,7 +98,7 @@ def check_auth(chat_id):
 
 def require_auth(fn):
     def wr(m, *a, **kw):
-        if not check_auth(m.chat.id): bot.reply_to(m, f"🔒 CHƯA KÍCH HOẠT\n👉 Dùng menu nút bên dưới để kích hoạt key\n📩 {ADMIN_USERNAME}"); return
+        if not check_auth(m.chat.id): bot.reply_to(m, f"🔒 CHƯA KÍCH HOẠT\n👉 /nhapkey KEY\n📩 {ADMIN_USERNAME}"); return
         return fn(m, *a, **kw)
     return wr
 
@@ -264,6 +262,38 @@ def _load_tele_session():
 def _save_tele_session(s):
     with open(TELE_SESSION_FILE, "w", encoding="utf-8") as f: f.write(s)
 
+
+def _activate_telethon_client(client, loop):
+    """Kích hoạt ngay client vừa đăng nhập; không cần restart bot."""
+    global tele_client, tele_loop, tele_ready
+    tele_client, tele_loop = client, loop
+
+    @client.on(events.NewMessage())
+    async def _on_msg(event):
+        _handle_tele_message(event)
+
+    async def _keep_running():
+        global tele_ready
+        try:
+            if not await client.is_user_authorized():
+                tele_ready = False
+                logger.error("Tele session chưa được Telegram xác thực.")
+                return
+            me = await client.get_me()
+            tele_ready = True
+            logger.info("TELE ONLINE sau đăng nhập: @%s", me.username or me.first_name)
+            try:
+                bot.send_message(ADMIN_ID, f"✅ TELE ONLINE @{me.username or me.first_name}", parse_mode="HTML")
+            except Exception:
+                pass
+            await client.run_until_disconnected()
+        except Exception as exc:
+            tele_ready = False
+            logger.exception("Tele listener lỗi: %s", exc)
+
+    # Chạy listener trên đúng event loop đã dùng để gửi OTP/xác minh.
+    loop.run_until_complete(_keep_running())
+
 def _handle_tele_message(event):
     if not redeem_state["enabled"] or redeem_state["channel_id"] is None: return
     if event.chat_id != redeem_state["channel_id"]: return
@@ -279,69 +309,28 @@ def _handle_tele_message(event):
 
 def _start_telethon_listener():
     global tele_client, tele_loop, tele_ready
-    if TELETHON_API_ID == 0 or not TELETHON_API_HASH:
-        logger.warning("Thiếu TELETHON_API_ID/HASH")
-        return
+    if TELETHON_API_ID == 0 or not TELETHON_API_HASH: return
     session_str = _load_tele_session()
     if not session_str:
-        logger.warning("Chua co session Telegram. Dung menu admin > Telegram nguồn để đăng nhập")
-        return
-
-    # Dừng client cũ nếu đang chạy
-    if tele_client is not None:
-        try:
-            if tele_loop and tele_loop.is_running():
-                asyncio.run_coroutine_threadsafe(tele_client.disconnect(), tele_loop)
-        except Exception:
-            pass
-        tele_client = None
-        tele_ready = False
-
-    tele_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(tele_loop)
-    try:
-        tele_client = TelegramClient(StringSession(session_str), TELETHON_API_ID, TELETHON_API_HASH, loop=tele_loop)
-    except Exception as e:
-        logger.error(f"Tele init: {e}")
-        return
-
+        logger.warning("Chua login Telegram. Dung /logintele"); return
+    tele_loop = asyncio.new_event_loop(); asyncio.set_event_loop(tele_loop)
+    try: tele_client = TelegramClient(StringSession(session_str), TELETHON_API_ID, TELETHON_API_HASH, loop=tele_loop)
+    except Exception as e: logger.error(f"Tele init: {e}"); return
     @tele_client.on(events.NewMessage())
-    async def _on_msg(event):
-        _handle_tele_message(event)
-
+    async def _on_msg(event): _handle_tele_message(event)
     async def _run():
         global tele_ready
         try:
             await tele_client.connect()
-            if not await tele_client.is_user_authorized():
-                logger.warning("Session không hợp lệ hoặc chưa authorized")
-                tele_ready = False
-                return
+            if not await tele_client.is_user_authorized(): return
             me = await tele_client.get_me()
             logger.info(f"TELE OK @{me.username or me.first_name}")
             tele_ready = True
-            try:
-                bot.send_message(ADMIN_ID, f"✅ TELE ONLINE @{me.username or me.first_name}", parse_mode="HTML")
-            except Exception:
-                pass
+            try: bot.send_message(ADMIN_ID, f"✅ TELE ONLINE @{me.username or me.first_name}", parse_mode="HTML")
+            except: pass
             await tele_client.run_until_disconnected()
-        except Exception as e:
-            logger.error(f"Tele run: {e}")
-            tele_ready = False
-        finally:
-            tele_ready = False
-
+        except Exception as e: logger.error(f"Tele run: {e}")
     tele_loop.run_until_complete(_run())
-
-
-def restart_telethon_listener():
-    """Khởi động lại listener Telethon (dùng sau khi login xong)."""
-    def _run():
-        try:
-            _start_telethon_listener()
-        except Exception as e:
-            logger.error(f"Restart telethon error: {e}")
-    threading.Thread(target=_run, daemon=True).start()
 
 def tele_resolve_entity(target, timeout=15):
     if tele_client is None or not tele_ready: raise RuntimeError("Tele chua san sang")
@@ -389,57 +378,58 @@ def flow_prompt(chat_id, message_id, flow, title, detail):
 
 def main_menu(cid=None):
     kb = telebot.types.InlineKeyboardMarkup(row_width=2)
-    kb.add(_btn("🔐 Đăng nhập Game", "login"), _btn("🔑 Kích hoạt Key", "nhapkey"))
-    kb.add(_btn("💎 Thông tin tài khoản", "tt"), _btn("📞 Liên hệ Admin", "contact"))
+    kb.add(_btn("🔐 ĐĂNG NHẬP GAME", "login"), _btn("🔑 KÍCH HOẠT KEY", "nhapkey"))
+    kb.add(_btn("💎 TÀI KHOẢN / HẠN DÙNG", "tt"))
     if cid == ADMIN_ID:
-        kb.add(_btn("👑 Quản trị hệ thống", "admin_panel"))
-    kb.add(_btn("ℹ️ Hướng dẫn sử dụng", "guide"))
+        kb.add(_btn("👑 QUẢN TRỊ", "admin_panel"))
     return kb
 
 
 def dashboard_menu(cid=None):
     kb = telebot.types.InlineKeyboardMarkup(row_width=2)
-    kb.add(_btn("🔐 Đăng nhập Game", "login"), _btn("💎 Thông tin", "tt"))
-    kb.add(_btn("📊 Số dư hiện tại", "balance"), _btn("📜 Lịch sử gần đây", "history"))
+    kb.add(_btn("🔐 ĐĂNG NHẬP GAME", "login"), _btn("💎 THÔNG TIN", "tt"))
     if cid == ADMIN_ID:
-        kb.add(_btn("🎛️ Quản lý hệ thống", "admin_panel"))
-    kb.add(_btn("🔄 Làm mới", "refresh"), _btn("📞 Liên hệ", "contact"))
+        kb.add(_btn("🎛️ QUẢN LÝ HỆ THỐNG", "admin_panel"))
     return kb
 
 
 def admin_menu():
     kb = telebot.types.InlineKeyboardMarkup(row_width=2)
-    kb.add(_btn("🎁 Redeem tự động", "rd_panel"), _btn("👥 Quản lý tài khoản", "data_panel"))
-    kb.add(_btn("🔑 Tạo Key VIP", "create_key"), _btn("📡 Telegram nguồn", "tele_panel"))
-    kb.add(_btn("📄 Xuất TXT tổng hợp", "export_txt"), _btn("⚙️ Cài đặt nhanh", "settings"))
-    kb.add(_btn("🏠 Menu chính", "home"))
+    kb.add(_btn("🎁 REDEEM TỰ ĐỘNG", "rd_panel"), _btn("👥 TÀI KHOẢN", "data_panel"))
+    kb.add(_btn("🔑 TẠO KEY VIP", "create_key"), _btn("📡 TELEGRAM NGUỒN", "tele_panel"))
+    kb.add(_btn("📄 XUẤT TXT TỔNG HỢP", "export_txt"))
+    kb.add(_btn("🔄 LÀM MỚI MENU", "admin_refresh"))
+    kb.add(_btn("⬅️ MENU CHÍNH", "home"))
     return kb
 
 
 def redeem_menu():
     kb = telebot.types.InlineKeyboardMarkup(row_width=2)
-    toggle = "⏹️ Tắt Auto Redeem" if redeem_state.get("enabled") else "▶️ Bật Auto Redeem"
-    kb.add(_btn(toggle, "rd_toggle"), _btn("📡 Đặt kênh code", "rd_setchannel"))
-    kb.add(_btn("➕ Thêm tài khoản", "rd_addacc"), _btn("➖ Xoá tài khoản", "rd_delacc"))
-    kb.add(_btn("📋 Danh sách Acc", "rd_list"), _btn("🧪 Test Code", "rd_test"))
-    kb.add(_btn("🔄 Làm mới Token", "rd_refresh"), _btn("🧹 Xoá Log", "rd_clear_confirm"))
-    kb.add(_btn("⬅️ Quay lại Quản trị", "admin_panel"))
+    toggle = "🟢 TẮT AUTO REDEEM" if redeem_state.get("enabled") else "⚪ BẬT AUTO REDEEM"
+    kb.add(_btn(toggle, "rd_toggle"), _btn("📡 ĐẶT KÊNH CODE", "rd_setchannel"))
+    kb.add(_btn("➕ THÊM TÀI KHOẢN", "rd_addacc"), _btn("➖ XOÁ TÀI KHOẢN", "rd_delacc"))
+    kb.add(_btn("📋 DANH SÁCH ACC", "rd_list"), _btn("🧪 TEST CODE", "rd_test"))
+    kb.add(_btn("🔄 LÀM MỚI TOKEN", "rd_refresh"), _btn("🧹 XOÁ LOG", "rd_clear_confirm"))
+    kb.add(_btn("🔄 LÀM MỚI", "rd_panel"))
+    kb.add(_btn("⬅️ QUẢN TRỊ", "admin_panel"))
     return kb
 
 
 def data_menu():
     kb = telebot.types.InlineKeyboardMarkup(row_width=2)
-    kb.add(_btn("🎁 Acc Redeem", "rd_list"), _btn("🎮 Game Acc", "ga_status"))
-    kb.add(_btn("🧹 Xoá Game Acc", "ga_clear_confirm"), _btn("📊 Thống kê nhanh", "stats"))
-    kb.add(_btn("⬅️ Quay lại Quản trị", "admin_panel"))
+    kb.add(_btn("🎁 ACC REDEEM", "rd_list"), _btn("🎮 GAME ACC", "ga_status"))
+    kb.add(_btn("🧹 XOÁ GAME ACC", "ga_clear_confirm"))
+    kb.add(_btn("🔄 LÀM MỚI", "data_panel"))
+    kb.add(_btn("⬅️ QUẢN TRỊ", "admin_panel"))
     return kb
 
 
 def tele_menu():
     kb = telebot.types.InlineKeyboardMarkup(row_width=2)
-    kb.add(_btn("🔐 Kết nối / Đăng nhập", "tele_login"), _btn("📊 Trạng thái", "tele_status_btn"))
-    kb.add(_btn("🔄 Khởi động lại Listener", "tele_restart"), _btn("🗑️ Đăng xuất Session", "tele_logout_confirm"))
-    kb.add(_btn("⬅️ Quay lại Quản trị", "admin_panel"))
+    kb.add(_btn("🔐 KẾT NỐI / ĐĂNG NHẬP", "tele_login"), _btn("📊 TRẠNG THÁI", "tele_status_btn"))
+    kb.add(_btn("🗑️ ĐĂNG XUẤT SESSION", "tele_logout_confirm"))
+    kb.add(_btn("🔄 LÀM MỚI TRẠNG THÁI", "tele_panel"))
+    kb.add(_btn("⬅️ QUẢN TRỊ", "admin_panel"))
     return kb
 
 
@@ -483,7 +473,6 @@ def send_all_export_file(chat_id):
         f"Kenh nguon: {redeem_state.get('channel_name') or 'Chua cai dat'}",
         f"Tong acc redeem: {len(REDEEM_ACCOUNTS)}",
         f"Tong game account: {len(game_accounts)}",
-        f"Tong nguoi dung Telegram: {len(user_profiles)}",
         f"Tong log: {len(redeem_logs)} | Thanh cong: {ok} | That bai: {len(redeem_logs)-ok}",
         f"Tong tien nhan ghi nhan: {amount:,}", "=" * 72, "", "[DANH SACH ACC REDEEM]"
     ]
@@ -492,10 +481,6 @@ def send_all_export_file(chat_id):
     lines += ["", "[DANH SACH GAME ACCOUNT]"]
     for i, (key, info) in enumerate(game_accounts.items(), 1):
         lines.append(f"{i}. Nickname: {info.get('nickname','')} | Username: {info.get('username','')} | So du: {int(info.get('money',0) or 0):,} | Login: {info.get('login_time','')}")
-    lines += ["", "[NGUOI DUNG TELEGRAM]"]
-    for i, profile in enumerate(user_profiles.values(), 1):
-        uname = "@" + profile.get("username", "") if profile.get("username") else "Khong co"
-        lines.append(f"{i}. ID: {profile.get('user_id','')} | Ten: {profile.get('full_name','')} | Username: {uname} | Ngon ngu: {profile.get('language_code','')} | Premium: {profile.get('is_premium', False)} | Start: {profile.get('start_count', 0)} | Lan dau: {profile.get('first_seen','')} | Gan nhat: {profile.get('last_seen','')}")
     lines += ["", "[LICH SU REDEEM]"]
     for i, item in enumerate(redeem_logs, 1):
         lines.append(f"{i}. {item.get('time','')} | Code: {item.get('code','')} | Account: {item.get('account','')} | Amount: {int(item.get('amount',0) or 0):,} | Status: {item.get('status','')}")
@@ -505,47 +490,9 @@ def send_all_export_file(chat_id):
     return bot.send_document(chat_id, bio, caption=f"📄 Báo cáo tổng hợp | {len(REDEEM_ACCOUNTS)} acc redeem | {len(game_accounts)} game acc | {len(redeem_logs)} log")
 
 
-def save_user_profile(user, chat_type="private"):
-    """Lưu hồ sơ Telegram cơ bản khi người dùng mở bot; không thu thập dữ liệu nhạy cảm."""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    uid = str(user.id)
-    previous = user_profiles.get(uid, {})
-    profile = {
-        "user_id": user.id,
-        "username": user.username or "",
-        "first_name": user.first_name or "",
-        "last_name": user.last_name or "",
-        "full_name": " ".join(x for x in [user.first_name, user.last_name] if x) or "Chưa đặt tên",
-        "language_code": getattr(user, "language_code", "") or "",
-        "is_premium": bool(getattr(user, "is_premium", False)),
-        "is_bot": bool(getattr(user, "is_bot", False)),
-        "first_seen": previous.get("first_seen", now),
-        "last_seen": now,
-        "start_count": int(previous.get("start_count", 0) or 0) + 1,
-        "chat_type": chat_type,
-    }
-    user_profiles[uid] = profile
-    save_json(USER_PROFILES_FILE, user_profiles)
-    return profile, uid not in {str(k) for k in user_profiles if str(k) != uid} and not previous
-
-
 @bot.message_handler(commands=['start', 'menu'])
 def cmd_start(m):
     cid = m.chat.id
-    profile, is_new_user = save_user_profile(m.from_user, getattr(m.chat, "type", "private"))
-    if ADMIN_ID and cid != ADMIN_ID:
-        uname = f"@{profile['username']}" if profile['username'] else "Không có username"
-        details = (f"{'🆕 NGƯỜI DÙNG MỚI' if is_new_user else '🔄 NGƯỜI DÙNG START LẠI'} <b>START BOT</b>\n"
-                   f"🆔 ID: <code>{profile['user_id']}</code>\n"
-                   f"👤 Tên: <b>{profile['full_name']}</b>\n"
-                   f"🔗 Username: {uname}\n"
-                   f"🌐 Ngôn ngữ: {profile['language_code'] or 'Không rõ'}\n"
-                   f"⭐ Premium: {'Có' if profile['is_premium'] else 'Không'}\n"
-                   f"🕒 Lần đầu: {profile['first_seen']}\n"
-                   f"🔁 Số lần mở bot: {profile['start_count']}\n"
-                   f"🕒 Vừa mở: {profile['last_seen']}")
-        try: bot.send_message(ADMIN_ID, details, parse_mode="HTML")
-        except Exception as e: logger.warning(f"Notify new user failed: {e}")
     try: bot.delete_message(cid, m.message_id)
     except Exception: pass
     old_id = SCREEN_MESSAGES.get(cid)
@@ -554,7 +501,7 @@ def cmd_start(m):
         except Exception: pass
     if check_auth(cid):
         han = "👑 QUẢN TRỊ VIÊN" if cid == ADMIN_ID else format_expire_time(authorized_users[cid])
-        msg = bot.send_message(cid, f"🤖 <b>{BOT_NAME}</b>\n✨ Trung tâm điều khiển LC79\n⏳ {han}\n\nChọn chức năng bên dưới:", parse_mode="HTML", reply_markup=dashboard_menu(cid))
+        msg = bot.send_message(cid, f"🤖 <b>{BOT_NAME}</b>\n✨ Trung tâm điều khiển LC79\n⏳ {han}\n\nChọn chức năng:", parse_mode="HTML", reply_markup=dashboard_menu(cid))
     else:
         msg = bot.send_message(cid, f"🤖 <b>{BOT_NAME}</b>\n\n🔒 Tài khoản chưa kích hoạt.\nChọn đăng nhập hoặc kích hoạt key:", parse_mode="HTML", reply_markup=main_menu(cid))
     SCREEN_MESSAGES[cid] = msg.message_id
@@ -562,7 +509,7 @@ def cmd_start(m):
 
 @bot.callback_query_handler(func=lambda c: True)
 def cb(c):
-    global redeem_logs, game_accounts, REDEEM_ACCOUNTS, tele_ready, tele_client, tele_loop
+    global redeem_logs, game_accounts, REDEEM_ACCOUNTS
     cid, data = c.message.chat.id, c.data
     try: bot.answer_callback_query(c.id)
     except Exception: pass
@@ -592,56 +539,13 @@ def cb(c):
         han = "👑 QUẢN TRỊ VIÊN" if cid == ADMIN_ID else format_expire_time(authorized_users[cid])
         return go(f"💎 <b>THÔNG TIN TÀI KHOẢN</b>\n\n⏳ Trạng thái: {han}\n🎮 Game account đã lưu: {sum(1 for x in game_accounts.values() if x.get('source') == str(cid))}", dashboard_menu(cid), "HTML")
 
-    if data == "contact":
-        return go(f"📞 <b>LIÊN HỆ ADMIN</b>\n\n📩 Telegram: {ADMIN_USERNAME}\n💬 Hỗ trợ kích hoạt key, báo lỗi hoặc tư vấn sử dụng.", main_menu(cid) if not check_auth(cid) else dashboard_menu(cid), "HTML")
-
-    if data == "guide":
-        guide_text = (
-            "ℹ️ <b>HƯỚNG DẪN SỬ DỤNG</b>\n\n"
-            "1️⃣ Kích hoạt Key VIP (nếu chưa có)\n"
-            "2️⃣ Đăng nhập tài khoản Game\n"
-            "3️⃣ Admin thiết lập Telegram nguồn + kênh code\n"
-            "4️⃣ Bật Auto Redeem để tự động nhận code\n\n"
-            "📌 Mọi thao tác đều dùng nút menu, không cần gõ lệnh."
-        )
-        return go(guide_text, main_menu(cid) if not check_auth(cid) else dashboard_menu(cid), "HTML")
-
-    if data == "balance":
-        if not check_auth(cid): return go("🔒 Bạn cần kích hoạt key.", main_menu(cid))
-        # Hiển thị số dư từ game accounts của user
-        user_accs = [x for x in game_accounts.values() if x.get("source") == str(cid)]
-        if not user_accs:
-            return go("💰 Chưa có tài khoản game nào được lưu.\nHãy đăng nhập game trước.", dashboard_menu(cid))
-        lines = [f"• <b>{a.get('nickname','')}</b>: {int(a.get('money',0) or 0):,}" for a in user_accs]
-        return go("💰 <b>SỐ DƯ HIỆN TẠI</b>\n\n" + "\n".join(lines), dashboard_menu(cid), "HTML")
-
-    if data == "history":
-        if not check_auth(cid): return go("🔒 Bạn cần kích hoạt key.", main_menu(cid))
-        recent = redeem_logs[-5:] if redeem_logs else []
-        if not recent:
-            return go("📜 Chưa có lịch sử redeem nào.", dashboard_menu(cid))
-        lines = [f"• <code>{l.get('code','')}</code> → {l.get('status','')} ({l.get('amount',0):,})" for l in reversed(recent)]
-        return go("📜 <b>LỊCH SỬ GẦN ĐÂY</b>\n\n" + "\n".join(lines), dashboard_menu(cid), "HTML")
-
-    if data == "settings":
-        if cid != ADMIN_ID: return go("⛔ Chỉ admin.", admin_menu())
-        return go("⚙️ <b>CÀI ĐẶT NHANH</b>\n\nDùng các menu Redeem và Telegram nguồn để cấu hình chi tiết.", admin_menu(), "HTML")
-
-    if data == "stats":
-        if cid != ADMIN_ID: return go("⛔ Chỉ admin.", admin_menu())
-        ok = sum(1 for l in redeem_logs if l.get("status") == "SUCCESS")
-        total = sum(int(l.get("amount",0) or 0) for l in redeem_logs if l.get("status") == "SUCCESS")
-        text = (f"📊 <b>THỐNG KÊ NHANH</b>\n\n"
-                f"🎁 Acc Redeem: {len(REDEEM_ACCOUNTS)}\n"
-                f"🎮 Game Acc: {len(game_accounts)}\n"
-                f"📝 Tổng log: {len(redeem_logs)}\n"
-                f"✅ Thành công: {ok}\n"
-                f"💰 Tổng nhận: {total:,}")
-        return go(text, data_menu(), "HTML")
-
     if data == "admin_panel":
         if cid != ADMIN_ID: return go("⛔ Bạn không có quyền quản trị.", dashboard_menu(cid) if check_auth(cid) else main_menu(cid))
         return go(f"👑 <b>TRUNG TÂM QUẢN TRỊ</b>\n\n🎁 Acc redeem: <b>{len(REDEEM_ACCOUNTS)}</b>\n🎮 Game account: <b>{len(game_accounts)}</b>\n📝 Lịch sử: <b>{len(redeem_logs)}</b>\n⚙️ Auto redeem: <b>{'🟢 ĐANG BẬT' if redeem_state.get('enabled') else '🔴 ĐANG TẮT'}</b>", admin_menu(), "HTML")
+
+    if data == "admin_refresh":
+        if cid != ADMIN_ID: return go("⛔ Chỉ admin.", dashboard_menu(cid))
+        return go(f"👑 <b>TRUNG TÂM QUẢN TRỊ</b>\\n\\n🎁 Acc redeem: <b>{len(REDEEM_ACCOUNTS)}</b>\\n🎮 Game account: <b>{len(game_accounts)}</b>\\n📝 Lịch sử: <b>{len(redeem_logs)}</b>\\n⚙️ Auto redeem: <b>{'🟢 ĐANG BẬT' if redeem_state.get('enabled') else '🔴 ĐANG TẮT'}</b>", admin_menu(), "HTML")
 
     if data == "create_key":
         if cid != ADMIN_ID: return go("⛔ Chỉ admin.", dashboard_menu(cid))
@@ -751,37 +655,29 @@ def cb(c):
 
     if data == "tele_panel":
         if cid != ADMIN_ID: return go("⛔ Chỉ admin.", admin_menu())
-        saved = os.path.exists(TELE_SESSION_FILE) or bool(os.environ.get("TELETHON_SESSION"))
-        if tele_ready:
-            status = "🟢 ONLINE"
-        elif saved:
-            status = "🟡 ĐÃ CÓ SESSION (đang chờ khởi động)"
-        else:
-            status = "🔴 CHƯA ĐĂNG NHẬP"
+        saved = bool(_load_tele_session())
+        status = "🟢 ĐÃ ĐĂNG NHẬP & ĐANG THEO DÕI" if tele_ready else ("🟡 CÓ SESSION, CHƯA KẾT NỐI" if saved else "🔴 CHƯA ĐĂNG NHẬP")
         return go(f"📡 <b>TELEGRAM NGUỒN</b>\n\nTrạng thái: {status}\nKênh code: {redeem_state.get('channel_name') or 'Chưa cài đặt'}\n\nDùng tài khoản Telegram của bạn để theo dõi kênh code.", tele_menu(), "HTML")
+
+    if data == "tele_login":
+        if cid != ADMIN_ID: return go("⛔ Chỉ admin.", admin_menu())
+        return flow_prompt(cid, c.message.message_id, "tele_phone", "🔐 KẾT NỐI TELEGRAM", "Gửi số điện thoại có mã quốc gia, ví dụ <code>+849xxxxxxxx</code>.")
 
     if data == "tele_status_btn":
         if cid != ADMIN_ID: return go("⛔ Chỉ admin.", admin_menu())
-        saved = os.path.exists(TELE_SESSION_FILE) or bool(os.environ.get("TELETHON_SESSION"))
-        client_status = "🟢 ONLINE" if tele_ready else "🔴 OFFLINE"
-        return go(f"📡 <b>TRẠNG THÁI TELEGRAM</b>\n\nAPI ID: {'✅' if TELETHON_API_ID else '❌'}\nAPI HASH: {'✅' if TELETHON_API_HASH else '❌'}\nSession file: {'✅' if saved else '❌'}\nClient: {client_status}\nKênh: {redeem_state.get('channel_name') or 'Chưa cài đặt'}", tele_menu(), "HTML")
+        saved = bool(_load_tele_session())
+        return go(f"📡 <b>TRẠNG THÁI TELEGRAM</b>\n\nAPI ID: {'✅' if TELETHON_API_ID else '❌'}\nAPI HASH: {'✅' if TELETHON_API_HASH else '❌'}\nSession: {'✅' if saved else '❌'}\nClient: {'🟢 ONLINE' if tele_ready else '🔴 OFFLINE'}\nKênh: {redeem_state.get('channel_name') or 'Chưa cài đặt'}", tele_menu(), "HTML")
 
-    if data == "tele_restart":
+    if data == "tele_logout_confirm":
         if cid != ADMIN_ID: return go("⛔ Chỉ admin.", admin_menu())
-        restart_telethon_listener()
-        return go("🔄 Đã gửi lệnh khởi động lại listener Telegram...", tele_menu())
+        kb = telebot.types.InlineKeyboardMarkup(row_width=2)
+        kb.add(_btn("🗑️ XOÁ SESSION", "tele_logout_yes"), _btn("↩️ QUAY LẠI", "tele_panel"))
+        return go("⚠️ Xoá session Telegram đã lưu? Bạn sẽ cần đăng nhập lại.", kb)
 
     if data == "tele_logout_yes":
         if cid != ADMIN_ID: return go("⛔ Chỉ admin.", admin_menu())
         if os.path.exists(TELE_SESSION_FILE): os.remove(TELE_SESSION_FILE)
-        tele_ready = False
-        if tele_client is not None:
-            try:
-                if tele_loop and tele_loop.is_running():
-                    asyncio.run_coroutine_threadsafe(tele_client.disconnect(), tele_loop)
-            except Exception:
-                pass
-        return go("✅ Đã xoá session Telegram và ngắt kết nối.", tele_menu())
+        return go("✅ Đã xoá session Telegram. Khởi động lại bot để áp dụng.", tele_menu())
 
     return go("Chức năng không tồn tại hoặc đã được cập nhật.", dashboard_menu(cid) if check_auth(cid) else main_menu(cid))
 
@@ -926,9 +822,10 @@ def handle_menu_input(m):
             client, loop = pending["client"], pending["loop"]
             try:
                 loop.run_until_complete(client.sign_in(phone=pending["phone"], code=value, phone_code_hash=pending["hash"]))
-                _save_tele_session(client.session.save()); tele_login_pending.clear(); user_flows.pop(cid, None)
-                bot.edit_message_text("✅ Đăng nhập Telegram thành công!\n🔄 Đang khởi động listener...", cid, status.message_id, reply_markup=tele_menu())
-                restart_telethon_listener()
+                _save_tele_session(client.session.save())
+                tele_login_pending.clear(); user_flows.pop(cid, None)
+                bot.edit_message_text("✅ Đăng nhập Telegram thành công. Đang bật theo dõi kênh ngay...", cid, status.message_id, reply_markup=tele_menu())
+                _activate_telethon_client(client, loop)
             except Exception as exc:
                 if "SessionPasswordNeeded" in type(exc).__name__ or "password" in str(exc).lower():
                     user_flows[cid] = {"step": "tele_password"}
@@ -946,9 +843,10 @@ def handle_menu_input(m):
             try:
                 client, loop = pending["client"], pending["loop"]
                 loop.run_until_complete(client.sign_in(password=value))
-                _save_tele_session(client.session.save()); tele_login_pending.clear(); user_flows.pop(cid, None)
-                bot.edit_message_text("✅ Đăng nhập Telegram thành công!\n🔄 Đang khởi động listener...", cid, status.message_id, reply_markup=tele_menu())
-                restart_telethon_listener()
+                _save_tele_session(client.session.save())
+                tele_login_pending.clear(); user_flows.pop(cid, None)
+                bot.edit_message_text("✅ Đăng nhập Telegram thành công. Đang bật theo dõi kênh ngay...", cid, status.message_id, reply_markup=tele_menu())
+                _activate_telethon_client(client, loop)
             except Exception as exc:
                 bot.edit_message_text(f"❌ Xác minh 2FA thất bại: {exc}", cid, status.message_id, reply_markup=tele_menu())
         threading.Thread(target=verify_password, daemon=True).start()
