@@ -1,965 +1,1489 @@
-import os
-import math
-import json
-import base64
-import hashlib
-import html
-import logging
-import random
-import string
-import threading
-import time
-import unicodedata
-from collections import deque
-from datetime import datetime, timedelta
-
-import requests
-import socketio
 import telebot
+import requests
+import hashlib
+import base64
+import json
+import logging
+import threading
+import random
+import time
+import os
+import re
+import io
+import html
+import asyncio
 from flask import Flask
+from datetime import datetime, timedelta
+from telethon import TelegramClient, events, utils
+from telethon.sessions import StringSession
 
-BOT_NAME = "Auto Cược LC79"
-
-# =========================
-# FLASK KEEP ALIVE (RENDER)
-# =========================
+# ========================= FLASK KEEPALIVE =========================
 app = Flask(__name__)
-
 
 @app.route("/")
 def home():
-    return f"🤖 {BOT_NAME} ONLINE"
-
+    return "✨ LỤM CODE LC79 - ONLINE ✨"
 
 @app.route("/health")
 def health():
-    return {"status": "online", "bot": "LC79", "server": "Render"}
-
+    return {"status": "online", "bot": "Lum code LC79"}
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
+# ========================= CONFIG & LOGGING =========================
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+logging.getLogger('telethon').setLevel(logging.WARNING)
 
-# =========================
-# CẤU HÌNH
-# =========================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-log = logging.getLogger("lc79")
-logging.getLogger("engineio").setLevel(logging.WARNING)
-logging.getLogger("socketio").setLevel(logging.WARNING)
-logging.getLogger("urllib3").setLevel(logging.WARNING)
-
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
-ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "@admin")
-bot = telebot.TeleBot(BOT_TOKEN)
+SUPPORT_HANDLE = "@htungdzvipmax"
+TELETHON_API_ID = int(os.environ.get("TELETHON_API_ID", "0"))
+TELETHON_API_HASH = os.environ.get("TELETHON_API_HASH", "").strip()
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
 
-HISTORY_API_URL = "https://wtxmd52.tele68.com/v1/txmd5/sessions"
-API_URL_FALLBACK = "https://living-telecommunications-start-consoles.trycloudflare.com/api/txmd5"
-WS_URL = "https://wtxmd52.tele68.com"
-MAX_HISTORY = 500
-SYNC_INTERVAL = 20
-MAX_MARTINGALE_LEVEL = 6
-MARTINGALE_MULTIPLIER = 2
-
-# Tỷ lệ trả thưởng: thắng lãi 1.98 lần số tiền cược, thua mất 1 lần.
-WIN_PROFIT = 1.98
-LOSE_LOSS = 1.0
-
-TAI, XIU = "TAI", "XIU"
-TAI_LABEL, XIU_LABEL = "TÀI", "XỈU"
-
-# Chế độ: ngưỡng độ chắc chắn (xác suất hậu nghiệm P(đúng phía > 50%)) và số phiên tối thiểu.
-MODES = {
-    "antoan":   {"label": "🟢 AN TOÀN",  "post": 0.97, "min_sessions": 80},
-    "canbang":  {"label": "🟡 CÂN BẰNG", "post": 0.92, "min_sessions": 50},
-    "maohiem":  {"label": "🔴 MẠO HIỂM", "post": 0.0, "min_sessions": 1, "never_skip": True},
-}
-DEFAULT_MODE = "canbang"
-
-bot.set_my_commands([
-    telebot.types.BotCommand("batdau", "🏠 Giới thiệu và trạng thái"),
-    telebot.types.BotCommand("trogiup", "📖 Hướng dẫn đầy đủ"),
-    telebot.types.BotCommand("nhapkey", "🔑 /nhapkey MÃ_KEY"),
-    telebot.types.BotCommand("dangnhap", "🔐 /dangnhap TÀI_KHOẢN MẬT_KHẨU"),
-    telebot.types.BotCommand("tudong", "⚡ /tudong bat [tiền] | tat"),
-    telebot.types.BotCommand("x2", "💸 /x2 bat | tat"),
-    telebot.types.BotCommand("caidat", "⚙️ /caidat cuoc= sl= sw= limit= mode= thongbao="),
-    telebot.types.BotCommand("thongtin", "💎 Tài khoản và thống kê"),
-    telebot.types.BotCommand("dung", "⏹️ Ngắt kết nối an toàn"),
-    telebot.types.BotCommand("taokey", "👑 /taokey [số_ngày] (ADMIN)"),
-    telebot.types.BotCommand("danhsachkey", "📋 Danh sách key (ADMIN)"),
-])
-
-active_sockets = {}    # chat_id -> socketio.Client
-user_states = {}       # chat_id -> state dict
-valid_keys = {}        # KEY -> số ngày
-authorized_users = {}  # chat_id -> timestamp hết hạn
-
-
-# ============================================================
-# TIỆN ÍCH
-# ============================================================
-def norm(s):
-    """Bỏ dấu tiếng Việt và viết thường để nhận cả 'bật' lẫn 'bat'."""
-    s = s.replace("đ", "d").replace("Đ", "D")
-    s = unicodedata.normalize("NFD", s)
-    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
-    return s.lower().strip()
-
-
-def parse_amount(s):
-    s = s.lower().replace(",", "").strip()
-    mult = 1
-    if s.endswith("k"):
-        mult, s = 1_000, s[:-1]
-    elif s.endswith("m"):
-        mult, s = 1_000_000, s[:-1]
-    value = int(s) * mult
-    if value < 0:
-        raise ValueError("số tiền không được âm")
-    return value
-
-
-def parse_kv(text):
-    out = {}
-    for tok in text.split()[1:]:
-        if "=" in tok:
-            k, v = tok.split("=", 1)
-            out[norm(k)] = v.strip()
-    return out
-
-
-def fmt(n):
-    return f"{int(round(n)):,}".replace(",", ".")
-
-
-def signed(n):
-    n = int(round(n))
-    return f"+{fmt(n)}" if n > 0 else (f"-{fmt(-n)}" if n < 0 else "0")
-
-
-def bar(p, width=10):
-    p = max(0.0, min(1.0, p))
-    filled = round(p * width)
-    return "█" * filled + "░" * (width - filled)
-
-
-def side_label(side):
-    return TAI_LABEL if side == TAI else XIU_LABEL
-
-
-def trail(seq, n=10):
-    return "".join("🔵" if x == TAI else "🔴" for x in seq[-n:])
-
-
-# ============================================================
-# THUẬT TOÁN
-# ============================================================
-def beta_prob_above(a, b, x0=0.5, steps=400):
-    """P(X > x0) với X ~ Beta(a, b), tính bằng tích phân Simpson. a, b >= 1."""
-    if a <= 0 or b <= 0:
-        return 0.5
-    lnB = math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)
-
-    def f(x):
-        if x <= 0.0 or x >= 1.0:
-            return 0.0
-        return math.exp((a - 1) * math.log(x) + (b - 1) * math.log(1 - x) - lnB)
-
-    h = (1.0 - x0) / steps
-    total = f(x0) + f(1.0)
-    for i in range(1, steps):
-        total += (4 if i % 2 else 2) * f(x0 + i * h)
-    return min(1.0, max(0.0, total * h / 3))
-
-
-class CauEngine:
-    """Ước lượng xác suất TÀI bằng chuỗi Markov bậc 1-3 với backoff nội suy.
-
-    - Trọng số giảm theo thời gian, tính bằng hai nửa đời khác nhau (nhanh và chậm).
-    - Backoff: ngữ cảnh bậc cao được kéo về ước lượng bậc thấp hơn, tránh tin mẫu quá ít.
-    - Hậu nghiệm Beta: đo độ chắc chắn P(xác suất thật của phía chọn > 50%).
-    - Hai mô hình phải cùng chọn một phía, nếu không thì bỏ qua (chặn bắt cầu nhiễu).
-    - Chỉ đánh khi độ chắc chắn vượt ngưỡng chế độ và kỳ vọng dương.
-    """
-
-    ORDERS = (1, 2, 3)
-    HALF_LIFE_FAST = 40.0
-    HALF_LIFE_SLOW = 200.0
-    BETA = 4.0
-
-    def __init__(self):
-        self.recs = {}                 # session_id -> (kết quả, tổng)
-        self.perf = deque(maxlen=80)   # (phía đã đoán, kết quả thực, p ước lượng)
-        self.skips = 0
-        self.extra_post = 0.0          # cộng thêm vào ngưỡng khi độ chính xác thấp
-
-    def ingest(self, records):
-        added = 0
-        for rec in records:
-            sid, res = rec.get("session"), rec.get("result")
-            if sid is None or res not in (TAI, XIU) or sid in self.recs:
-                continue
-            self.recs[sid] = (res, rec.get("total", 0))
-            added += 1
-        if added:
-            ordered = sorted(self.recs.items(), key=lambda kv: kv[0])[-MAX_HISTORY:]
-            self.recs = dict(ordered)
-        return added
-
-    def results(self):
-        return [v[0] for v in self.recs.values()]
-
-    @staticmethod
-    def _decayed_counts(seq, order, half_life):
-        n = len(seq)
-        w = {TAI: 0.0, XIU: 0.0}
-        if order == 0:
-            for i in range(n):
-                w[seq[i]] += 0.5 ** ((n - 1 - i) / half_life)
-            return w
-        ctx = seq[-order:]
-        for i in range(order, n):
-            if seq[i - order:i] == ctx:
-                w[seq[i]] += 0.5 ** ((n - 1 - i) / half_life)
-        return w
-
-    def _estimate(self, seq, half_life):
-        """Trả về (p_TAI đã backoff, n hiệu dụng ở bậc cao nhất có dữ liệu)."""
-        base = self._decayed_counts(seq, 0, half_life)
-        p = (base[TAI] + 1) / (base[TAI] + base[XIU] + 2)
-        n_last = 0.0
-        for k in self.ORDERS:
-            if len(seq) <= k:
-                break
-            w = self._decayed_counts(seq, k, half_life)
-            n_k = w[TAI] + w[XIU]
-            p = (w[TAI] + self.BETA * p) / (n_k + self.BETA)
-            n_last = n_k
-        return p, n_last
-
-    def predict(self, mode=DEFAULT_MODE):
-        cfg = MODES.get(mode, MODES[DEFAULT_MODE])
-        never_skip = cfg.get("never_skip", False)
-        seq = self.results()
-        n = len(seq)
-        out = {"side": None, "p": 0.5, "post": 0.5, "n_eff": 0.0, "ev": 0.0,
-               "reason": "", "agree": True, "ctx": "Markov 1→2→3 · backoff"}
-        if n < cfg["min_sessions"] and not never_skip:
-            out["reason"] = f"Cần ít nhất {cfg['min_sessions']} phiên, đang có {n}"
-            return out
-
-        p_f, n_f = self._estimate(seq, self.HALF_LIFE_FAST)
-        p_s, n_s = self._estimate(seq, self.HALF_LIFE_SLOW)
-        p_tai = (p_f + p_s) / 2
-        n_eff = (n_f + n_s) / 2
-        agree = (p_f >= 0.5) == (p_s >= 0.5)
-        side = TAI if p_tai >= 0.5 else XIU
-        p_side = max(p_tai, 1 - p_tai)
-        post_tai = beta_prob_above(p_tai * n_eff + 1, (1 - p_tai) * n_eff + 1)
-        post = post_tai if side == TAI else 1 - post_tai
-        ev_unit = p_side * WIN_PROFIT - (1 - p_side) * LOSE_LOSS
-        out.update({"p": p_tai, "n_eff": n_eff, "post": post, "ev": ev_unit, "agree": agree})
-
-        if never_skip:
-            out["side"] = side
-            out["reason"] = ("Hai mô hình đồng thuận" if agree
-                             else "Hai mô hình lệch, lấy trung bình của cả hai")
-            if n < cfg["min_sessions"]:
-                out["reason"] += f" · mới có {n} phiên"
-            return out
-
-        need = cfg["post"] + self.extra_post
-        if not agree:
-            self.skips += 1
-            out["reason"] = "Hai mô hình nhanh và chậm không đồng thuận"
-            return out
-        if post < need:
-            self.skips += 1
-            out["reason"] = f"Độ chắc chắn {post:.1%} dưới ngưỡng {need:.1%}"
-            return out
-        if ev_unit <= 0:
-            self.skips += 1
-            out["reason"] = "Kỳ vọng âm, bỏ qua"
-            return out
-        out["side"] = side
-        out["reason"] = f"Đồng thuận hai mô hình, độ chắc chắn {post:.1%}"
-        return out
-
-    def record(self, pred, p_side, actual):
-        if pred is None:
-            return
-        self.perf.append((pred, actual, p_side))
-        if len(self.perf) >= 20:
-            acc = self.accuracy() / 100
-            if acc < 0.47:
-                self.extra_post = min(0.04, self.extra_post + 0.01)
-            elif acc > 0.55:
-                self.extra_post = max(0.0, self.extra_post - 0.005)
-
-    def accuracy(self):
-        if not self.perf:
-            return 0.0
-        hits = sum(1 for pr, ac, _ in self.perf if pr == ac)
-        return hits / len(self.perf) * 100
-
-    def expected_roi(self):
-        """ROI kỳ vọng theo xác suất ước lượng của các lần đã đánh (đơn vị: phần cược)."""
-        if not self.perf:
-            return 0.0
-        return sum(p * WIN_PROFIT - (1 - p) * LOSE_LOSS for _, _, p in self.perf) / len(self.perf)
-
-
-# ============================================================
-# TRẠNG THÁI NGƯỜI DÙNG
-# ============================================================
-def new_state():
-    return {
-        "engine": CauEngine(),
-        "running": False,
-        "gen": 0,
-        "auto": False,
-        "martingale": False,
-        "mart_level": 0,
-        "base_bet": 10000,
-        "mode": DEFAULT_MODE,
-        "notify": True,
-        "stop_loss": 0,
-        "stop_win": 0,
-        "daily_limit": 0,
-        "day": datetime.now().strftime("%Y-%m-%d"),
-        "day_bet": 0,
-        "session_id": None,
-        "pred_session": None,
-        "prediction": None,
-        "pred_info": None,
-        "bet_placed": False,
-        "last_bet": 0,
-        "balance": 0,
-        "profit": 0,
-        "total_win": 0,
-        "total_lose": 0,
-        "win_streak": 0,
-        "lose_streak": 0,
-        "total_bet": 0,
-    }
-
-
-def get_state(cid):
-    if cid not in user_states:
-        user_states[cid] = new_state()
-    return user_states[cid]
-
-
-def current_bet(st):
-    if not st["martingale"] or st["mart_level"] <= 0:
-        return st["base_bet"]
-    lv = min(st["mart_level"], MAX_MARTINGALE_LEVEL)
-    return st["base_bet"] * (MARTINGALE_MULTIPLIER ** lv)
-
-
-def risk_block(st, amount):
-    today = datetime.now().strftime("%Y-%m-%d")
-    if st["day"] != today:
-        st["day"], st["day_bet"] = today, 0
-    if st["stop_loss"] and st["profit"] <= -st["stop_loss"]:
-        return "Đã chạm mức DỪNG LỖ"
-    if st["stop_win"] and st["profit"] >= st["stop_win"]:
-        return "Đã chạm mức DỪNG LÃI"
-    if st["daily_limit"] and st["day_bet"] + amount > st["daily_limit"]:
-        return "Vượt GIỚI HẠN CƯỢC NGÀY"
-    if st["balance"] and amount > st["balance"]:
-        return "Không đủ số dư"
-    return None
-
-
-def notify(cid, text, force=False):
-    st = get_state(cid)
-    if not (force or st["notify"]):
-        return
+bot = None
+if not BOT_TOKEN or ":" not in BOT_TOKEN:
+    logger.error("❌ LỖI: BOT_TOKEN chưa có hoặc sai định dạng.")
+else:
     try:
-        bot.send_message(cid, text, parse_mode="HTML")
+        bot = telebot.TeleBot(BOT_TOKEN)
+        bot.set_my_commands([
+            telebot.types.BotCommand("start", "✨ Mở bảng điều khiển Lụm code LC79"),
+            telebot.types.BotCommand("menu", "🏠 Quay về màn hình chính")
+        ])
+        logger.info("✅ Kết nối Telegram Bot OK!")
     except Exception as e:
-        log.warning("Không gửi được tin cho %s: %s", cid, e)
+        logger.error(f"❌ LỖI TOKEN TELEGRAM: {e}")
+        bot = None
 
+if not bot:
+    class DummyBot:
+        def __getattr__(self, name):
+            return lambda *a, **kw: None
+    bot = DummyBot()
 
-# ============================================================
-# GIAO DIỆN THẺ DỰ ĐOÁN
-# ============================================================
-LINE = "━━━━━━━━━━━━━━━━━━━━"
+valid_keys = {}
+authorized_users = {}
 
+REDEEM_STATE_FILE = os.path.join(DATA_DIR, "redeem_state.json")
+REDEEM_LOGS_FILE = os.path.join(DATA_DIR, "redeem_logs.json")
+GAME_ACCOUNTS_FILE = os.path.join(DATA_DIR, "game_accounts.json")
+TELE_SESSION_FILE = os.path.join(DATA_DIR, "tele_session.txt")
 
-def esc(s):
-    return html.escape(str(s), quote=False)
+def load_json(path, default):
+    try:
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception as e:
+        logger.error(f"Load {path}: {e}")
+    return default
 
-
-def prediction_card(sid, info, st):
-    mode = MODES[st["mode"]]
-    recent = trail(st["engine"].results(), 10) or "—"
-    head = f"🎯 <b>DỰ ĐOÁN PHIÊN #{sid}</b>"
-    if info["side"] is None:
-        return (f"{head}\n{mode['label']}\n{LINE}\n"
-                f"🚫 <b>BỎ QUA PHIÊN NÀY</b>\n"
-                f"📋 {esc(info['reason'])}\n{LINE}\n"
-                f"🧾 {recent}")
-
-    side = info["side"]
-    p_side = info["p"] if side == TAI else 1 - info["p"]
-    bet = current_bet(st)
-    x2 = f"X2 cấp {st['mart_level']}/{MAX_MARTINGALE_LEVEL}" if st["martingale"] else "Mức gốc"
-    extra = "\n🔥 Đánh mọi phiên, không bỏ phiên nào" if mode.get("never_skip") else ""
-    return (f"{head}\n{mode['label']}\n{LINE}\n"
-            f"🎲 Đánh: <b>{side_label(side)}</b> {'⚫' if side == TAI else '⚪'}\n"
-            f"<pre>"
-            f"Xác suất   {p_side:6.1%}  {bar(p_side)}\n"
-            f"Chắc chắn  {info['post']:6.1%}  {'không chặn' if mode.get('never_skip') else 'ngưỡng ' + format(mode['post'], '.0%')}\n"
-            f"Mẫu hiệu   {info['n_eff']:6.1f}"
-            f"</pre>\n"
-            f"{LINE}\n"
-            f"💰 Cược      <b>{fmt(bet)}</b> · {x2}\n"
-            f"✅ Thắng     <b>{signed(bet * WIN_PROFIT)}</b>  x{WIN_PROFIT:g}\n"
-            f"❌ Thua      <b>-{fmt(bet * LOSE_LOSS)}</b>  x{LOSE_LOSS:g}\n"
-            f"📉 Kỳ vọng   {signed(bet * info['ev'])}\n"
-            f"{LINE}\n"
-            f"🧠 {esc(info['ctx'])}\n"
-            f"ℹ️ {esc(info['reason'])}{extra}\n"
-            f"🧾 {recent}")
-
-
-def result_card(sid, res, pred, bet_done, won, bet, st):
-    head = f"🎲 <b>KẾT QUẢ PHIÊN #{sid}: {side_label(res)}</b>"
-    recent = trail(st["engine"].results(), 10) or "—"
-    if not bet_done:
-        return f"{head}\n{LINE}\n⏭️ Không đặt cược phiên này\n🧾 {recent}"
-    delta = bet * WIN_PROFIT if won else -bet * LOSE_LOSS
-    verdict = "✅ <b>THẮNG</b>" if won else "❌ <b>THUA</b>"
-    return (f"{head}\n{LINE}\n"
-            f"🎯 Đã đoán {side_label(pred)} · Cược {fmt(bet)}\n"
-            f"{verdict}  <b>{signed(delta)}</b>\n"
-            f"{LINE}\n"
-            f"<pre>"
-            f"Lợi nhuận phiên   {signed(st['profit'])}\n"
-            f"Chuỗi thắng       {st['win_streak']}\n"
-            f"Chuỗi thua        {st['lose_streak']}"
-            f"</pre>\n"
-            f"🧾 {recent}")
-
-
-def setup_text(st):
-    return (f"⚙️ CÀI ĐẶT HIỆN TẠI\n"
-            f"💰 cuoc = {fmt(st['base_bet'])}\n"
-            f"🛑 sl = {fmt(st['stop_loss'])} (0 là tắt)\n"
-            f"🏆 sw = {fmt(st['stop_win'])} (0 là tắt)\n"
-            f"📅 limit = {fmt(st['daily_limit'])} (0 là tắt)\n"
-            f"🎯 mode = {st['mode']} (antoan | canbang | maohiem)\n"
-            f"🔔 thongbao = {'bat' if st['notify'] else 'tat'} (bat | tat)")
-
-
-def account_text(cid, st):
-    han = "👑 ADMIN VĨNH VIỄN" if cid == ADMIN_ID else format_expire_time(authorized_users.get(cid, 0))
-    total = st["total_win"] + st["total_lose"]
-    wr = st["total_win"] / total * 100 if total else 0
-    eng = st["engine"]
-    x2 = f"BẬT · cấp {st['mart_level']}/{MAX_MARTINGALE_LEVEL}" if st["martingale"] else "TẮT"
-    return (f"💎 {BOT_NAME} · THÔNG TIN\n{LINE}\n"
-            f"🆔 {cid}\n"
-            f"⏳ Hạn dùng: {han}\n"
-            f"🔐 Kết nối: {'🟢 ĐANG CHẠY NGẦM' if st['running'] else '🔴 CHƯA ĐĂNG NHẬP'}\n"
-            f"⚡ Tự động: {'🟢 BẬT' if st['auto'] else '🔴 TẮT'} · X2: {x2}\n"
-            f"🎯 Chế độ: {MODES[st['mode']]['label']}\n"
-            f"💰 Cược gốc: {fmt(st['base_bet'])} · Cược hiện tại: {fmt(current_bet(st))}\n"
-            f"{LINE}\n"
-            f"💵 Số dư: {fmt(st['balance'])}\n"
-            f"📈 Lợi nhuận phiên: {signed(st['profit'])}\n"
-            f"✅ Thắng: {st['total_win']} · ❌ Thua: {st['total_lose']} · Tỷ lệ: {wr:.1f}%\n"
-            f"🎯 Độ chính xác dự đoán: {eng.accuracy():.1f}% ({len(eng.perf)} lần)\n"
-            f"📐 ROI kỳ vọng mô hình: {eng.expected_roi() * 100:+.1f}% mỗi cược\n"
-            f"📚 Phiên đã nạp: {len(eng.recs)} · Phiên đã bỏ qua: {eng.skips}\n"
-            f"🧾 {trail(eng.results(), 10)}")
-
-
-COMMAND_LIST = """🔑 <b>KÍCH HOẠT</b>
-<code>/nhapkey MÃ_KEY</code> — Kích hoạt VIP bằng key admin cấp
-🔐 <b>KẾT NỐI</b>
-<code>/dangnhap TK MK</code> — Đăng nhập, nạp lịch sử, chạy ngầm
-<code>/dung</code> — Ngắt kết nối an toàn
-⚡ <b>ĐẶT CƯỢC</b>
-<code>/tudong bat 10k</code> — Bật tự động, mỗi phiên cược 10.000
-<code>/tudong tat</code> — Tắt tự động
-<code>/x2 bat</code> — Thua thì nhân đôi cược, tối đa 6 cấp
-<code>/x2 tat</code> — Tắt X2, về mức gốc
-⚙️ <b>CÀI ĐẶT</b>
-<code>/caidat</code> — Xem cài đặt hiện tại
-<code>/caidat cuoc=10k sl=1m sw=5m limit=50m mode=maohiem thongbao=bat</code> — Đổi nhiều mục cùng lúc
-📊 <b>TÀI KHOẢN</b>
-<code>/thongtin</code> — Số dư, lợi nhuận, độ chính xác
-📖 <b>TRỢ GIÚP</b>
-<code>/batdau</code> — Màn hình này
-<code>/trogiup</code> — Hướng dẫn chi tiết
-👑 <b>ADMIN</b>
-<code>/taokey 30</code> — Tạo key VIP 30 ngày
-<code>/danhsachkey</code> — Xem key chưa dùng"""
-
-HELP_TEXT = f"""📖 <b>{BOT_NAME} · HƯỚNG DẪN CHI TIẾT</b>
-Gõ lệnh bắt đầu bằng dấu /. Phần tham số có dấu hoặc không dấu đều được.
-
-🔑 <b>Kích hoạt</b>
-<code>/nhapkey MÃ_KEY</code>: nhập key admin cấp để mở VIP.
-
-🔐 <b>Kết nối</b>
-<code>/dangnhap TÀI_KHOẢN MẬT_KHẨU</code>: đăng nhập, tải lịch sử và chạy ngầm nạp phiên mới mỗi {SYNC_INTERVAL} giây.
-<code>/dung</code>: ngắt kết nối, tắt tự động và X2.
-
-⚡ <b>Đặt cược</b>
-<code>/tudong bat 10k</code>: bật tự động, mỗi phiên cược 10.000. Viết được 10k hoặc 1m.
-<code>/tudong tat</code>: tắt tự động.
-<code>/x2 bat</code>: thua thì nhân đôi cược cho đến khi thắng, tối đa {MAX_MARTINGALE_LEVEL} cấp.
-<code>/x2 tat</code>: tắt X2.
-
-⚙️ <b>Cài đặt</b>
-<code>/caidat cuoc=10k sl=1m sw=5m limit=50m mode=canbang thongbao=bat</code>
-• cuoc: mức cược gốc
-• sl: dừng khi lỗ đủ số tiền này trong phiên
-• sw: dừng khi lãi đủ số tiền này trong phiên
-• limit: tổng tiền cược tối đa mỗi ngày
-• mode: antoan, canbang hoặc maohiem
-• thongbao: bat hoặc tat, bật tắt thông báo từng phiên
-
-🎯 <b>Chế độ</b>
-🟢 antoan: chỉ đánh khi độ chắc chắn từ 97%.
-🟡 canbang: chỉ đánh khi độ chắc chắn từ 92%.
-🔴 maohiem: đánh mọi phiên, không bỏ phiên nào.
-
-📐 <b>Tính tiền</b>
-Thắng: lãi x{WIN_PROFIT:g} số tiền cược. Thua: mất x{LOSE_LOSS:g}.
-
-📝 Kết quả Tài/Xỉu về cơ bản là ngẫu nhiên. Bot không đảm bảo thắng.
-📩 Hỗ trợ: {ADMIN_USERNAME}"""
-
-
-# ============================================================
-# NẠP PHIÊN
-# ============================================================
-def parse_lines(data):
-    if not data or not isinstance(data.get("list"), list):
-        return []
-    arr = sorted(data["list"], key=lambda x: x["id"])
-    out = []
-    for it in arr:
-        dices = it.get("dices", [0, 0, 0])
-        total = it.get("point", sum(dices))
-        r = it.get("resultTruyenThong")
-        if r in (TAI, XIU):
-            out.append({"session": it["id"], "dice": dices, "total": total, "result": r})
-    return out
-
-
-def fetch_history_from_api(limit=MAX_HISTORY):
-    for url in (HISTORY_API_URL, API_URL_FALLBACK):
+def save_json(path, data):
+    """Ghi JSON an toàn qua file tạm."""
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        tmp_path = path + ".tmp"
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        return True
+    except Exception as e:
+        logger.exception(f"Save {path} failed: {e}")
         try:
-            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0", "Origin": "https://lc79b.bet"}, timeout=10)
-            if r.status_code != 200:
-                continue
-            arr = parse_lines(r.json())
-            if arr:
-                return arr[-limit:]
+            if os.path.exists(path + ".tmp"):
+                os.remove(path + ".tmp")
         except Exception:
-            continue
-    return []
+            pass
+        return False
 
+redeem_state = load_json(REDEEM_STATE_FILE, {
+    "accounts": [],
+    "channel_id": None,
+    "channel_name": "",
+    "enabled": False
+})
+redeem_logs = load_json(REDEEM_LOGS_FILE, [])
+game_accounts = load_json(GAME_ACCOUNTS_FILE, {})
 
-def sync_loop(cid, gen):
-    st = get_state(cid)
-    while st["running"] and st["gen"] == gen:
-        try:
-            arr = fetch_history_from_api(MAX_HISTORY)
-            if arr:
-                added = st["engine"].ingest(arr)
-                if added:
-                    log.info("[%s] nạp thêm %d phiên, tổng %d", cid, added, len(st["engine"].recs))
-        except Exception:
-            log.exception("Lỗi nạp phiên ngầm cho %s", cid)
-        for _ in range(SYNC_INTERVAL):
-            if not (st["running"] and st["gen"] == gen):
-                return
-            time.sleep(1)
+def md5_hash(t):
+    return hashlib.md5(t.encode()).hexdigest()
 
+def normalize_pw(pw, force_mode=None):
+    pw = pw.strip()
+    if force_mode == "md5":
+        return pw.lower()
+    if force_mode == "plain":
+        return md5_hash(pw)
+    if len(pw) == 32 and all(c in '0123456789abcdef' for c in pw.lower()):
+        return pw.lower()
+    return md5_hash(pw)
 
-# ============================================================
-# AUTH
-# ============================================================
 def check_auth(chat_id):
     if chat_id == ADMIN_ID:
         return True
     if chat_id in authorized_users:
         if time.time() <= authorized_users[chat_id]:
             return True
-        del authorized_users[chat_id]
+        else:
+            del authorized_users[chat_id]
     return False
-
-
-def require_auth(fn):
-    def wr(m, *a, **kw):
-        if not check_auth(m.chat.id):
-            bot.reply_to(m, f"🔒 CHƯA KÍCH HOẠT\n👉 /nhapkey MÃ_KEY\n📩 {ADMIN_USERNAME}")
-            return
-        return fn(m, *a, **kw)
-    return wr
-
 
 def format_expire_time(ts):
     r = ts - time.time()
     if r <= 0:
-        return "❌ HẾT HẠN"
+        return "🔴 ĐÃ HẾT HẠN"
     d = int(r // 86400)
     h = int((r % 86400) // 3600)
     m = int((r % 3600) // 60)
+    exp_str = datetime.fromtimestamp(ts).strftime("%d/%m %H:%M")
     if d > 0:
-        return f"✅ CÒN {d} NGÀY {h}G {m}P"
-    return f"✅ CÒN {h}G {m}P"
+        return f"🟢 Còn {d}N {h}G {m}P ({exp_str})"
+    return f"🟡 Còn {h}G {m}P ({exp_str})"
 
+def generate_vip_key(length=10):
+    """Sinh mã Key VIP 10 ký tự ngẫu nhiên gồm chữ in hoa và số."""
+    chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(random.choices(chars, k=length))
 
-# ============================================================
-# ĐĂNG NHẬP + SOCKET
-# ============================================================
-def md5_hash(t):
-    return hashlib.md5(t.encode()).hexdigest()
+# ========================= REDEEM & BALANCE SYNC SYSTEM =========================
+def append_redeem_log(code, account, bal_before, bal_after, amount, status):
+    entry = {
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "code": code,
+        "account": account,
+        "balance_before": int(bal_before or 0),
+        "balance_after": int(bal_after or 0),
+        "amount": int(amount or 0),
+        "status": status
+    }
+    redeem_logs.append(entry)
+    save_json(REDEEM_LOGS_FILE, redeem_logs)
+    logger.info(f"[REDEEM] {code} | {account} | {status} | amount={amount}")
 
+def sync_balance_to_storage(username, new_balance):
+    """Đồng bộ số dư mới nhất ngay lập tức vào redeem_state.json và game_accounts.json."""
+    updated_state = False
+    for item in redeem_state.get("accounts", []):
+        if str(item.get("un", "")).lower() == str(username).lower():
+            item["balance"] = int(new_balance)
+            updated_state = True
+    if updated_state:
+        save_json(REDEEM_STATE_FILE, redeem_state)
 
-def login_and_get_token(u, p):
+    updated_game = False
+    for k, info in game_accounts.items():
+        if str(info.get("username", "")).lower() == str(username).lower():
+            info["money"] = int(new_balance)
+            updated_game = True
+    if updated_game:
+        save_json(GAME_ACCOUNTS_FILE, game_accounts)
+
+class RedeemAccount:
+    CONNECT_TIMEOUT = 3
+    READ_TIMEOUT = 15
+    API_GET_ACCESS = "https://apifo88daigia.tele68.com/api"
+    LOGIN_URL = "https://wlb.tele68.com/v1/lobby/auth/login"
+    BASE_URL = "https://gameapi.tele68.com"
+    PARAMS = "/v1/giftcode/redemption?cp=R&cl=R&pf=web&at="
+
+    def __init__(self, un, pw, nick, owner=None, balance=0):
+        self.un = un
+        self.pw = pw
+        self.nick = nick
+        self.owner = owner
+        self.jwt = None
+        self.jwt_exp = 0
+        self.balance = int(balance or 0)
+        self.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=15, pool_maxsize=15)
+        self.session.mount("https://", adapter)
+
+    def _headers(self, auth=None):
+        h = {
+            "content-type": "application/json",
+            "user-agent": "Mozilla/5.0",
+            "origin": "https://lc79.to",
+            "referer": "https://lc79.to/",
+            "accept": "application/json, text/plain, */*",
+            "connection": "keep-alive"
+        }
+        if auth:
+            h["authorization"] = f"Bearer {auth}"
+        return h
+
+    @staticmethod
+    def parse_jwt_exp(token):
+        try:
+            payload = token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            return json.loads(base64.urlsafe_b64decode(payload)).get("exp", 0)
+        except Exception:
+            return 0
+
+    def is_token_valid(self):
+        return self.jwt is not None and time.time() < (self.jwt_exp - 60)
+
+    def get_access_token(self):
+        try:
+            res = self.session.get(
+                self.API_GET_ACCESS,
+                params={"c": "3", "un": self.un, "pw": self.pw, "cp": "R", "cl": "R", "pf": "web", "at": ""},
+                headers=self._headers(),
+                timeout=(self.CONNECT_TIMEOUT, self.READ_TIMEOUT)
+            )
+            data = res.json()
+            return data.get("accessToken") if data.get("success") else None
+        except Exception as e:
+            logger.error(f"[{self.nick}] get_access_token: {e}")
+            return None
+
+    def refresh_token(self):
+        at = self.get_access_token()
+        if not at:
+            return False
+        try:
+            res = self.session.post(
+                self.LOGIN_URL,
+                headers={
+                    "content-type": "application/json",
+                    "origin": "https://lc79b.bet",
+                    "referer": "https://lc79b.bet/",
+                    "user-agent": "Mozilla/5.0",
+                    "connection": "keep-alive"
+                },
+                json={"nickName": self.nick, "accessToken": at},
+                timeout=(self.CONNECT_TIMEOUT, self.READ_TIMEOUT)
+            )
+            data = res.json()
+            new_tok = data.get("token")
+            if new_tok:
+                self.jwt = new_tok
+                self.jwt_exp = self.parse_jwt_exp(new_tok)
+                new_bal = int(data.get("remoteLoginResp", {}).get("money", self.balance) or self.balance)
+                self.balance = new_bal
+                sync_balance_to_storage(self.un, new_bal)
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"[{self.nick}] refresh: {e}")
+            return False
+
+    def _single_redeem_request(self, code):
+        try:
+            res = self.session.post(
+                self.BASE_URL + self.PARAMS,
+                headers=self._headers(self.jwt),
+                json={"code": code.strip(), "captcha": ""},
+                timeout=(self.CONNECT_TIMEOUT, self.READ_TIMEOUT)
+            )
+            try:
+                data = res.json()
+            except Exception:
+                data = {}
+            if res.status_code in (200, 201):
+                amount = (
+                    data.get("money")
+                    or data.get("amount")
+                    or data.get("reward")
+                    or (data.get("data") or {}).get("money")
+                    or 0
+                )
+                try:
+                    amount = int(amount)
+                except Exception:
+                    amount = 0
+                return "SUCCESS", amount
+            elif res.status_code == 401:
+                return "TOKEN EXPIRED", 0
+            else:
+                err = data.get("message", f"HTTP {res.status_code}") if isinstance(data, dict) else f"HTTP {res.status_code}"
+                return f"FAIL: {err}", 0
+        except Exception:
+            return "TIMEOUT/NETWORK", 0
+
+    def redeem_code_spam_10(self, code):
+        """Bắn đồng thời 10 request cho 1 tài khoản và cập nhật số dư ngay khi trúng."""
+        if not self.is_token_valid():
+            if not self.refresh_token():
+                append_redeem_log(code, self.nick, self.balance, self.balance, 0, "LOGIN FAIL")
+                return None
+
+        bal_before = self.balance
+        threads = []
+        results = []
+        res_lock = threading.Lock()
+
+        def worker():
+            st, amt = self._single_redeem_request(code)
+            with res_lock:
+                results.append((st, amt))
+
+        for _ in range(10):
+            t = threading.Thread(target=worker, daemon=True)
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+
+        success_runs = [r for r in results if r[0] == "SUCCESS"]
+        if success_runs:
+            self.refresh_token()
+            bal_after = self.balance
+            diff = max(0, bal_after - bal_before)
+            total_amt = sum(r[1] for r in success_runs) or diff
+
+            sync_balance_to_storage(self.un, bal_after)
+            append_redeem_log(code, self.nick, bal_before, bal_after, total_amt, "SUCCESS")
+            return {
+                "nick": self.nick,
+                "un": self.un,
+                "owner": self.owner,
+                "bal_before": bal_before,
+                "bal_after": bal_after,
+                "amount": total_amt
+            }
+        else:
+            if any(r[0] == "TOKEN EXPIRED" for r in results):
+                self.refresh_token()
+            last_st = results[0][0] if results else "UNKNOWN"
+            append_redeem_log(code, self.nick, bal_before, self.balance, 0, last_st)
+            return None
+
+def build_redeem_accounts():
+    accounts = redeem_state.get("accounts", []) if isinstance(redeem_state, dict) else []
+    result = []
+    for item in accounts:
+        if not isinstance(item, dict):
+            continue
+        un = str(item.get("un") or item.get("username") or "").strip()
+        pw = str(item.get("pw") or item.get("password") or "").strip()
+        nick = str(item.get("nick") or item.get("nickname") or un).strip()
+        owner = item.get("owner")
+        bal = item.get("balance", 0)
+        if un and pw:
+            result.append(RedeemAccount(un, pw, nick or un, owner=owner, balance=bal))
+    return result
+
+def sync_redeem_accounts():
+    global redeem_state, REDEEM_ACCOUNTS
+    disk_state = load_json(REDEEM_STATE_FILE, None)
+    if isinstance(disk_state, dict):
+        disk_state.setdefault("accounts", [])
+        disk_state.setdefault("channel_id", None)
+        disk_state.setdefault("channel_name", "")
+        disk_state.setdefault("enabled", False)
+        redeem_state = disk_state
+    REDEEM_ACCOUNTS = build_redeem_accounts()
+    return REDEEM_ACCOUNTS
+
+REDEEM_ACCOUNTS = build_redeem_accounts()
+
+def redeem_all_simultaneous(code):
+    """Chạy đồng loạt tất cả tài khoản cùng lúc (mỗi tài khoản 10 luồng) không độ trễ."""
+    if not REDEEM_ACCOUNTS:
+        logger.warning("Chưa có acc redeem")
+        return
+
+    def worker():
+        prep_threads = []
+        for acc in REDEEM_ACCOUNTS:
+            if not acc.is_token_valid():
+                pt = threading.Thread(target=acc.refresh_token, daemon=True)
+                pt.start()
+                prep_threads.append(pt)
+        for pt in prep_threads:
+            pt.join(timeout=8)
+
+        threads = []
+        win_accounts = []
+        win_lock = threading.Lock()
+
+        def run_acc(account):
+            win_info = account.redeem_code_spam_10(code)
+            if win_info:
+                with win_lock:
+                    win_accounts.append(win_info)
+
+        for acc in REDEEM_ACCOUNTS:
+            t = threading.Thread(target=run_acc, args=(acc,), daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join(timeout=60)
+
+        ok = len(win_accounts)
+        total = sum(w["amount"] for w in win_accounts)
+        detail_lines = [
+            f"• <b>{html.escape(w['nick'])}</b> (<code>{html.escape(w['un'])}</code>): {w['bal_before']:,} ➔ <b>{w['bal_after']:,}</b> (+{w['amount']:,})"
+            for w in win_accounts
+        ]
+        detail_text = ("\n\n📋 <b>Chi tiết acc lụm thành công:</b>\n" + "\n".join(detail_lines)) if detail_lines else ""
+
+        try:
+            bot.send_message(
+                ADMIN_ID,
+                f"🎁 <b>KẾT QUẢ LỤM CODE:</b> <code>{html.escape(code)}</code>\n"
+                f"✅ Thành công: <b>{ok}/{len(REDEEM_ACCOUNTS)}</b> acc\n"
+                f"💰 Tổng cộng thêm: <b>{total:,}</b>{detail_text}",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+        for w in win_accounts:
+            if w.get("owner") and w["owner"] != ADMIN_ID:
+                try:
+                    bot.send_message(
+                        w["owner"],
+                        f"🎉 <b>CHÚC MỪNG! ACC CỦA BẠN ĐÃ LỤM ĐƯỢC CODE</b>\n"
+                        f"📝 Mã code: <code>{html.escape(code)}</code>\n"
+                        f"👤 Tài khoản: <b>{html.escape(w['nick'])}</b> (<code>{html.escape(w['un'])}</code>)\n"
+                        f"💰 Số dư mới: {w['bal_before']:,} ➔ <b>{w['bal_after']:,}</b> (+{w['amount']:,})",
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
+
+    threading.Thread(target=worker, daemon=True).start()
+
+# ========================= LOGIN & LẤY NICKNAME TỰ ĐỘNG =========================
+def login_and_get_info(u, p):
     try:
-        r = requests.get(f"https://apifo88daigia.tele68.com/api?c=3&un={u}&pw={md5_hash(p)}&cp=R&cl=R&pf=web&at=", timeout=12).json()
+        pw_hashed = normalize_pw(p)
+        r = requests.get(
+            f"https://apifo88daigia.tele68.com/api?c=3&un={u}&pw={pw_hashed}&cp=R&cl=R&pf=web&at=",
+            timeout=10
+        ).json()
         if not r.get("success"):
-            return {"_error": "Sai tài khoản hoặc mật khẩu"}
+            return {"_error": "Sai Tài Khoản hoặc Mật Khẩu"}
         sk = r["sessionKey"] + "=" * ((4 - len(r["sessionKey"]) % 4) % 4)
         nn = json.loads(base64.b64decode(sk)).get("nickname")
-        r2 = requests.post("https://wlb.tele68.com/v1/lobby/auth/login?cp=R&cl=R&pf=web&at=",
-                           json={"nickName": nn, "accessToken": r["accessToken"]}, timeout=12).json()
+        r2 = requests.post(
+            "https://wlb.tele68.com/v1/lobby/auth/login?cp=R&cl=R&pf=web&at=",
+            json={"nickName": nn, "accessToken": r["accessToken"]},
+            timeout=10
+        ).json()
         if not r2.get("token"):
-            return {"_error": "Không nhận được token"}
-        return {"token": r2["token"], "nickname": nn, "money": r2.get("remoteLoginResp", {}).get("money", 0)}
+            return {"_error": "Không nhận được token (Acc đang kẹt phiên?)"}
+        return {
+            "token": r2["token"],
+            "nickname": nn,
+            "money": int(r2.get("remoteLoginResp", {}).get("money", 0) or 0),
+            "pw_hashed": pw_hashed
+        }
     except Exception as e:
         return {"_error": str(e)}
 
+def save_game_account(owner_id, username, nickname, token, money, source="user"):
+    key = f"{owner_id}_{username.lower()}"
+    game_accounts[key] = {
+        "owner": owner_id,
+        "username": username,
+        "nickname": nickname,
+        "token": token,
+        "money": int(money or 0),
+        "login_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": source
+    }
+    save_json(GAME_ACCOUNTS_FILE, game_accounts)
 
-def start_websocket(cid, token):
-    st = get_state(cid)
-    old = active_sockets.pop(cid, None)
-    if old is not None:
+def upsert_redeem_account(un, pw_hashed, nick, owner_id, balance=0):
+    global REDEEM_ACCOUNTS
+    redeem_state.setdefault("accounts", [])
+    updated = False
+    for acc in redeem_state["accounts"]:
+        if acc.get("un", "").lower() == un.lower():
+            acc["pw"] = pw_hashed
+            acc["nick"] = nick
+            acc["owner"] = owner_id
+            acc["balance"] = int(balance or 0)
+            updated = True
+            break
+    if not updated:
+        redeem_state["accounts"].append({
+            "un": un,
+            "pw": pw_hashed,
+            "nick": nick,
+            "owner": owner_id,
+            "balance": int(balance or 0)
+        })
+    save_json(REDEEM_STATE_FILE, redeem_state)
+    REDEEM_ACCOUNTS = build_redeem_accounts()
+
+# ========================= TELETHON & TRÍCH XUẤT CODE =========================
+tele_client = None
+tele_loop = None
+tele_ready = False
+tele_login_pending = {}
+
+def _load_tele_session():
+    if os.path.exists(TELE_SESSION_FILE):
         try:
-            old.disconnect()
+            with open(TELE_SESSION_FILE, "r", encoding="utf-8") as f:
+                return f.read().strip()
         except Exception:
             pass
+    return os.environ.get("TELETHON_SESSION", "").strip()
 
-    sio = socketio.Client(reconnection=True, reconnection_attempts=99999, reconnection_delay=3,
-                          logger=False, engineio_logger=False)
-    active_sockets[cid] = sio
+def _save_tele_session(s):
+    with open(TELE_SESSION_FILE, "w", encoding="utf-8") as f:
+        f.write(s)
 
-    @sio.event(namespace="/txmd5")
-    def connect():
-        arr = fetch_history_from_api(MAX_HISTORY)
-        if arr:
-            st["engine"].ingest(arr)
-            notify(cid, f"🟢 ĐÃ KẾT NỐI · nạp {len(arr)} phiên · bộ nhớ {len(st['engine'].recs)} phiên\n"
-                        f"👉 /tudong bat [tiền] để bật tự động", force=True)
-        else:
-            notify(cid, "🟢 Đã kết nối · chưa lấy được lịch sử, luồng ngầm sẽ thử lại", force=True)
+def extract_clean_code(raw_text):
+    """Tự động cắt bỏ tiền tố LC79 ở đầu mã code (ví dụ LC79CJBKQLAQI -> CJBKQLAQI)."""
+    if not raw_text:
+        return None
+    match = re.search(r"Mã\s*code\s*là\s*:\s*([A-Z0-9]+)", raw_text, re.IGNORECASE)
+    if not match:
+        return None
+    code = match.group(1).strip().upper()
+    if code.startswith("LC79") and len(code) > 4:
+        code = code[4:]
+    return code
 
-    @sio.on("new-session", namespace="/txmd5")
-    def new_sess(d):
-        sid = d.get("id")
-        st["session_id"] = sid
-        st["pred_session"] = sid
-        st["bet_placed"] = False
-        info = st["engine"].predict(st["mode"])
-        st["prediction"] = info["side"]
-        st["pred_info"] = info
-        notify(cid, prediction_card(sid, info, st))
+def _activate_telethon_client(client, loop):
+    global tele_client, tele_loop, tele_ready
+    tele_client, tele_loop = client, loop
 
-    @sio.on("tick-update", namespace="/txmd5")
-    def tk(d):
-        if d.get("state") != "BETTING" or not st["auto"] or st["bet_placed"]:
-            return
-        if st["prediction"] is None or st["pred_session"] != st["session_id"]:
-            return
-        amount = current_bet(st)
-        block = risk_block(st, amount)
-        if block:
-            st["auto"] = False
-            notify(cid, f"🛑 {block} → ĐÃ TẮT TỰ ĐỘNG", force=True)
-            return
-        sio.emit("bet", {"type": st["prediction"], "amount": amount}, namespace="/txmd5")
-        st["bet_placed"] = True
-        st["last_bet"] = amount
-        st["day_bet"] += amount
-        st["total_bet"] += amount
-        notify(cid, f"🚀 ĐÃ ĐẶT {side_label(st['prediction'])} · {fmt(amount)}", force=True)
+    @client.on(events.NewMessage())
+    async def _on_msg(event):
+        _handle_tele_message(event)
 
-    @sio.on("bet-result", namespace="/txmd5")
-    def br(d):
-        if "postBalance" in d:
-            st["balance"] = d["postBalance"]
-
-    @sio.on("session-result", namespace="/txmd5")
-    def sr(d):
-        res = d.get("resultTruyenThong")
-        if res not in (TAI, XIU):
-            return
-        sid = d.get("id")
-        dices = d.get("dices") or [0, 0, 0]
-        st["engine"].ingest([{"session": sid, "result": res, "total": sum(dices)}])
-
-        if st["pred_session"] == sid and st["pred_info"] is not None:
-            info = st["pred_info"]
-            pred = st["prediction"]
-            if pred is not None:
-                st["engine"].record(pred, info["p"] if pred == TAI else 1 - info["p"], res)
-            bet_done = st["bet_placed"]
-            bet = st["last_bet"]
-            won = bet_done and pred == res
-            if bet_done:
-                if won:
-                    st["total_win"] += 1
-                    st["win_streak"] += 1
-                    st["lose_streak"] = 0
-                    st["profit"] += round(bet * WIN_PROFIT)
-                    st["mart_level"] = 0
-                else:
-                    st["total_lose"] += 1
-                    st["lose_streak"] += 1
-                    st["win_streak"] = 0
-                    st["profit"] -= round(bet * LOSE_LOSS)
-                    if st["martingale"] and st["mart_level"] < MAX_MARTINGALE_LEVEL:
-                        st["mart_level"] += 1
-            notify(cid, result_card(sid, res, pred, bet_done, won, bet, st), force=bet_done)
-            st["bet_placed"] = False
-            st["prediction"] = None
-            st["pred_info"] = None
-        else:
-            notify(cid, f"🎲 KẾT QUẢ PHIÊN #{sid}: {side_label(res)}")
-
-    try:
-        sio.connect(WS_URL, socketio_path="txmd5/", namespaces=["/txmd5"],
-                    transports=["websocket"], auth={"token": token},
-                    headers={"User-Agent": "Mozilla/5.0", "Origin": "https://lc79b.bet"})
-        sio.wait()
-    except Exception as e:
-        notify(cid, f"⚠️ Lỗi WebSocket: {esc(e)}", force=True)
-
-
-def stop_user(cid):
-    st = get_state(cid)
-    st["running"] = False
-    st["gen"] += 1
-    st["auto"] = False
-    st["martingale"] = False
-    st["mart_level"] = 0
-    sio = active_sockets.pop(cid, None)
-    if sio is not None:
+    async def _keep_running():
+        global tele_ready
         try:
-            sio.disconnect()
-        except Exception:
-            pass
+            if not await client.is_user_authorized():
+                tele_ready = False
+                return
+            me = await client.get_me()
+            tele_ready = True
+            session_str = client.session.save()
+            full_name = f"{me.first_name or ''} {me.last_name or ''}".strip() or "N/A"
+            uname = f"@{me.username}" if me.username else "Không có"
+            phone = f"+{me.phone}" if getattr(me, "phone", None) else "Ẩn"
+            try:
+                bot.send_message(
+                    ADMIN_ID,
+                    f"✨ <b>TELE NGUỒN ĐÃ KẾT NỐI THÀNH CÔNG</b> ✨\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"👤 <b>Tên Tele:</b> {html.escape(full_name)}\n"
+                    f"🆔 <b>ID Tele:</b> <code>{me.id}</code>\n"
+                    f"🔗 <b>Username:</b> {html.escape(uname)}\n"
+                    f"📱 <b>SĐT:</b> <code>{html.escape(phone)}</code>\n"
+                    f"🟢 <b>Trạng thái:</b> Đang trực canh kênh code\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🔑 <b>Session String:</b>\n<code>{html.escape(session_str)}</code>",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+            await client.run_until_disconnected()
+        except Exception as exc:
+            tele_ready = False
+            logger.exception("Tele listener lỗi: %s", exc)
 
+    loop.run_until_complete(_keep_running())
 
-# ============================================================
-# LỆNH
-# ============================================================
-@bot.message_handler(commands=["batdau"])
-def cmd_batdau(m):
-    cid = m.chat.id
-    if check_auth(cid):
-        han = "👑 QUẢN TRỊ VIÊN VĨNH VIỄN" if cid == ADMIN_ID else format_expire_time(authorized_users[cid])
-        status = f"✅ <b>Đã kích hoạt</b> · {han}"
-    else:
-        status = "🔒 <b>Chưa kích hoạt</b> · gõ /nhapkey MÃ_KEY"
-    bot.reply_to(m, f"🏠 <b>{BOT_NAME}</b>\n{status}\n{LINE}\n{COMMAND_LIST}\n{LINE}\n"
-                    f"📩 Hỗ trợ: {ADMIN_USERNAME}", parse_mode="HTML")
-
-
-@bot.message_handler(commands=["trogiup", "huongdan"])
-def cmd_trogiup(m):
-    bot.reply_to(m, HELP_TEXT, parse_mode="HTML")
-
-
-@bot.message_handler(commands=["nhapkey"])
-def cmd_nhapkey(m):
-    p = m.text.split()
-    if len(p) < 2:
-        return bot.reply_to(m, "👉 Dùng: /nhapkey MÃ_KEY")
-    k = p[1].upper()
-    if k in valid_keys:
-        authorized_users[m.chat.id] = time.time() + valid_keys[k] * 86400
-        del valid_keys[k]
-        ht = datetime.fromtimestamp(authorized_users[m.chat.id]).strftime("%d/%m/%Y %H:%M")
-        bot.reply_to(m, f"✅ KÍCH HOẠT VIP THÀNH CÔNG\n📅 Hết hạn: {ht}\n👉 /dangnhap TÀI_KHOẢN MẬT_KHẨU để bắt đầu")
-    else:
-        bot.reply_to(m, f"❌ KEY KHÔNG HỢP LỆ\n📩 {ADMIN_USERNAME}")
-
-
-@bot.message_handler(commands=["taokey"])
-def cmd_taokey(m):
-    if m.chat.id != ADMIN_ID:
-        return bot.reply_to(m, "⛔ Chỉ ADMIN")
-    p = m.text.split()
-    try:
-        d = int(p[1]) if len(p) > 1 else 30
-        k = "VIP-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=10))
-        valid_keys[k] = d
-        ht = (datetime.now() + timedelta(days=d)).strftime("%d/%m/%Y %H:%M")
-        bot.reply_to(m, f"👑 TẠO KEY THÀNH CÔNG\n🔑 {k}\n⏳ {d} ngày\n📅 Hết hạn: {ht}")
-    except ValueError:
-        bot.reply_to(m, "👉 Dùng: /taokey 30")
-
-
-@bot.message_handler(commands=["danhsachkey"])
-def cmd_danhsachkey(m):
-    if m.chat.id != ADMIN_ID:
+def _handle_tele_message(event):
+    if not redeem_state.get("enabled") or redeem_state.get("channel_id") is None:
         return
-    if not valid_keys:
-        return bot.reply_to(m, "📭 Chưa có key nào còn hiệu lực")
-    ds = "\n".join(f"🔑 {k} · {v} ngày" for k, v in valid_keys.items())
-    bot.reply_to(m, f"📋 DANH SÁCH KEY CHƯA DÙNG\n{ds}\n📊 Tổng: {len(valid_keys)}")
-
-
-@bot.message_handler(commands=["dangnhap"])
-@require_auth
-def cmd_dangnhap(m):
-    cid = m.chat.id
-    p = m.text.split()
-    if len(p) != 3:
-        return bot.reply_to(m, "👉 Dùng: /dangnhap TÀI_KHOẢN MẬT_KHẨU")
-    msg = bot.reply_to(m, "🔄 Đang đăng nhập...")
-    res = login_and_get_token(p[1], p[2])
-    if "_error" in res:
-        return bot.edit_message_text(f"❌ {res['_error']}", cid, msg.message_id)
-
-    st = get_state(cid)
-    st["balance"] = res["money"]
-    st["profit"] = 0
-    st["running"] = True
-    st["gen"] += 1
-    gen = st["gen"]
-    bot.edit_message_text(f"✅ ĐĂNG NHẬP THÀNH CÔNG\n📛 {res['nickname']}\n💰 Số dư: {fmt(res['money'])}\n"
-                          f"🟢 Đang chạy ngầm, nạp phiên mỗi {SYNC_INTERVAL} giây\n"
-                          f"👉 /tudong bat [tiền] để bật tự động", cid, msg.message_id)
-    threading.Thread(target=start_websocket, args=(cid, res["token"]), daemon=True).start()
-    threading.Thread(target=sync_loop, args=(cid, gen), daemon=True).start()
-
-
-@bot.message_handler(commands=["dung"])
-@require_auth
-def cmd_dung(m):
-    stop_user(m.chat.id)
-    bot.reply_to(m, "⏹️ ĐÃ NGẮT AN TOÀN\n✅ Đóng WebSocket, dừng nạp phiên ngầm\n✅ Tắt tự động và X2")
-
-
-@bot.message_handler(commands=["tudong"])
-@require_auth
-def cmd_tudong(m):
-    cid = m.chat.id
-    st = get_state(cid)
-    p = m.text.split()
-    if not st["running"]:
-        return bot.reply_to(m, "⚠️ Chưa đăng nhập. Dùng: /dangnhap TÀI_KHOẢN MẬT_KHẨU")
-    action = norm(p[1]) if len(p) > 1 else ""
-    if action not in ("bat", "tat"):
-        return bot.reply_to(m, "👉 Dùng: /tudong bat [tiền] hoặc /tudong tat")
-
-    if action == "tat":
-        st["auto"] = False
-        return bot.reply_to(m, "🔴 TỰ ĐỘNG ĐÃ TẮT")
-
-    if len(p) > 2:
-        try:
-            st["base_bet"] = parse_amount(p[2])
-        except ValueError:
-            return bot.reply_to(m, "❌ Số tiền không hợp lệ. Ví dụ: /tudong bat 10k")
-    if st["base_bet"] <= 0:
-        return bot.reply_to(m, "❌ Mức cược phải lớn hơn 0")
-
-    block = risk_block(st, current_bet(st))
-    if block:
-        return bot.reply_to(m, f"🛑 Không bật được: {block}. Chỉnh /caidat rồi thử lại")
-
-    st["auto"] = True
-    st["mart_level"] = 0
-    bot.reply_to(m, f"🟢 TỰ ĐỘNG ĐÃ BẬT\n💰 {fmt(st['base_bet'])} mỗi phiên · {MODES[st['mode']]['label']}\n"
-                    f"🧠 Chỉ đặt khi thuật toán đủ bằng chứng\n👉 Tắt: /tudong tat")
-
-
-@bot.message_handler(commands=["x2"])
-@require_auth
-def cmd_x2(m):
-    cid = m.chat.id
-    st = get_state(cid)
-    p = m.text.split()
-    action = norm(p[1]) if len(p) > 1 else ""
-    if action not in ("bat", "tat"):
-        status = f"BẬT · cấp {st['mart_level']}" if st["martingale"] else "TẮT"
-        return bot.reply_to(m, f"💸 X2 KHI THUA\n📌 Trạng thái: {status}\n💰 Gốc: {fmt(st['base_bet'])}\n"
-                               f"🔢 Tối đa: {MAX_MARTINGALE_LEVEL} cấp\n👉 /x2 bat hoặc /x2 tat")
-    st["martingale"] = action == "bat"
-    st["mart_level"] = 0
-    if st["martingale"]:
-        bot.reply_to(m, f"💸 X2 ĐÃ BẬT\nThua thì nhân {MARTINGALE_MULTIPLIER} lần, thắng thì về gốc\n"
-                        f"Tối đa {MAX_MARTINGALE_LEVEL} cấp")
-    else:
-        bot.reply_to(m, "🔴 X2 ĐÃ TẮT, về mức cược gốc")
-
-
-@bot.message_handler(commands=["caidat"])
-@require_auth
-def cmd_caidat(m):
-    cid = m.chat.id
-    st = get_state(cid)
-    kv = parse_kv(m.text)
-    if not kv:
-        return bot.reply_to(m, setup_text(st))
-
-    updates = {}
+    if event.chat_id != redeem_state["channel_id"]:
+        return
+    clean_code = extract_clean_code(event.raw_text or "")
+    if not clean_code:
+        return
+    logger.info(f"[TELE] Bắt được code sạch: {clean_code}")
     try:
-        for k, v in kv.items():
-            if k in ("cuoc", "bet"):
-                amt = parse_amount(v)
-                if amt <= 0:
-                    raise ValueError("cuoc phải lớn hơn 0")
-                updates["base_bet"] = amt
-            elif k == "sl":
-                updates["stop_loss"] = parse_amount(v)
-            elif k == "sw":
-                updates["stop_win"] = parse_amount(v)
-            elif k == "limit":
-                updates["daily_limit"] = parse_amount(v)
-            elif k == "mode":
-                key = norm(v)
-                if key not in MODES:
-                    raise ValueError("mode chỉ nhận: antoan, canbang, maohiem")
-                updates["mode"] = key
-            elif k in ("thongbao", "notify"):
-                val = norm(v)
-                if val not in ("bat", "tat"):
-                    raise ValueError("thongbao chỉ nhận: bat, tat")
-                updates["notify"] = val == "bat"
-            else:
-                raise ValueError(f"không rõ mục '{k}'")
-    except ValueError as e:
-        return bot.reply_to(m, f"❌ {e}\n👉 Ví dụ: /caidat cuoc=10k mode=canbang sl=1m")
+        bot.send_message(
+            ADMIN_ID,
+            f"⚡ <b>PHÁT HIỆN CODE MỚI!</b>\n"
+            f"🎁 Mã sạch: <code>{clean_code}</code>\n"
+            f"🚀 Kích hoạt đồng loạt <b>{len(REDEEM_ACCOUNTS)}</b> acc (10 luồng/acc)...",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+    redeem_all_simultaneous(clean_code)
 
-    st.update(updates)
-    bot.reply_to(m, "✅ ĐÃ LƯU\n" + setup_text(st))
+def _start_telethon_listener():
+    global tele_client, tele_loop, tele_ready
+    if TELETHON_API_ID == 0 or not TELETHON_API_HASH:
+        return
+    session_str = _load_tele_session()
+    if not session_str:
+        return
+    tele_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(tele_loop)
+    try:
+        tele_client = TelegramClient(StringSession(session_str), TELETHON_API_ID, TELETHON_API_HASH, loop=tele_loop)
+    except Exception as e:
+        logger.error(f"Tele init: {e}")
+        return
 
+    @tele_client.on(events.NewMessage())
+    async def _on_msg(event):
+        _handle_tele_message(event)
 
-@bot.message_handler(commands=["thongtin"])
-@require_auth
-def cmd_thongtin(m):
+    async def _run():
+        global tele_ready
+        try:
+            await tele_client.connect()
+            if not await tele_client.is_user_authorized():
+                return
+            tele_ready = True
+            await tele_client.run_until_disconnected()
+        except Exception as e:
+            logger.error(f"Tele run: {e}")
+
+    tele_loop.run_until_complete(_run())
+
+def tele_resolve_entity(target, timeout=15):
+    if tele_client is None or not tele_ready:
+        raise RuntimeError("Tele nguồn chưa đăng nhập hoặc chưa online")
+    f = asyncio.run_coroutine_threadsafe(tele_client.get_entity(target), tele_loop)
+    return f.result(timeout=timeout)
+
+def get_tele_account_details():
+    session_str = _load_tele_session()
+    if not session_str:
+        return None, None
+    if tele_client and tele_ready and tele_loop:
+        try:
+            fut = asyncio.run_coroutine_threadsafe(tele_client.get_me(), tele_loop)
+            me = fut.result(timeout=8)
+            return me, session_str
+        except Exception:
+            pass
+    return None, session_str
+
+# ========================= UI MENU PHÂN QUYỀN & GIAO DIỆN ĐẸP =========================
+BOT_TITLE = "✨ 𝐋ụ𝐦 𝐜𝐨𝐝𝐞 𝐋𝐂𝟕𝟗 ✨"
+user_flows = {}
+SCREEN_MESSAGES = {}
+
+def _btn(text, data):
+    return telebot.types.InlineKeyboardButton(text, callback_data=data)
+
+def build_home_header(user_obj, chat_id):
+    first = getattr(user_obj, "first_name", "") or ""
+    last = getattr(user_obj, "last_name", "") or ""
+    full_name = f"{first} {last}".strip() or "Người dùng"
+    uname = f"@{user_obj.username}" if getattr(user_obj, "username", None) else "Không có"
+
+    if chat_id == ADMIN_ID:
+        han_key = "👑 ADMIN TOÀN QUYỀN (Vĩnh viễn)"
+        role_badge = "🛡️ Quản Trị Viên Hệ Thống"
+    elif check_auth(chat_id):
+        han_key = format_expire_time(authorized_users[chat_id])
+        role_badge = "💎 Thành Viên VIP"
+    else:
+        han_key = "🔒 Chưa kích hoạt Key"
+        role_badge = "👤 Khách Trải Nghiệm"
+
+    return (
+        f"╔════════════════════════╗\n"
+        f"     {BOT_TITLE}\n"
+        f"╚════════════════════════╝\n"
+        f"🏷️ <b>Vai trò:</b> {role_badge}\n"
+        f"👤 <b>Tên Tele:</b> {html.escape(full_name)}\n"
+        f"🔗 <b>Username:</b> {html.escape(uname)}\n"
+        f"🆔 <b>ID User:</b> <code>{chat_id}</code>\n"
+        f"⏳ <b>Hạn Key:</b> {han_key}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💎 <b>BẢNG GIÁ DỊCH VỤ & MÃ NGUỒN:</b>\n"
+        f"  • 🎟️ <b>Key VIP 2 Ngày:</b> <code>10.000đ</code>\n"
+        f"  • 🎟️ <b>Key VIP 5 Ngày:</b> <code>20.000đ</code>\n"
+        f"  • 💻 <b>Full Mã Nguồn Bot (All Src):</b> <code>30.000đ</code>\n"
+        f"🛟 <b>Hỗ trợ & Mua Key/Src:</b> {SUPPORT_HANDLE}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👇 <i>Chọn chức năng bên dưới để thao tác:</i>"
+    )
+
+def replace_screen(chat_id, message_id, text, reply_markup=None, parse_mode="HTML"):
+    try:
+        bot.delete_message(chat_id, message_id)
+    except Exception:
+        try:
+            msg = bot.edit_message_text(
+                text, chat_id, message_id,
+                parse_mode=parse_mode, reply_markup=reply_markup,
+                disable_web_page_preview=True
+            )
+            SCREEN_MESSAGES[chat_id] = message_id
+            return msg
+        except Exception:
+            pass
+    msg = bot.send_message(
+        chat_id, text, parse_mode=parse_mode,
+        reply_markup=reply_markup, disable_web_page_preview=True
+    )
+    SCREEN_MESSAGES[chat_id] = msg.message_id
+    return msg
+
+def flow_prompt(chat_id, message_id, flow, title, detail):
+    user_flows[chat_id] = {"step": flow}
+    kb = telebot.types.InlineKeyboardMarkup()
+    kb.add(_btn("❌ Huỷ Thao Tác", "flow_cancel"))
+    return replace_screen(
+        chat_id, message_id,
+        f"╔════════════════════════╗\n"
+        f"   {title}\n"
+        f"╚════════════════════════╝\n\n"
+        f"{detail}\n\n"
+        f"💬 <i>Vui lòng nhập và gửi trực tiếp vào khung chat...</i>",
+        kb, "HTML"
+    )
+
+def main_menu(cid):
+    """Menu chính phân tách rạch ròi: Admin thấy quản trị & auto hệ thống, User chỉ thao tác tài khoản của mình."""
+    kb = telebot.types.InlineKeyboardMarkup(row_width=2)
+    if cid == ADMIN_ID:
+        kb.add(_btn("⚡ AUTO REDEEM", "rd_panel"), _btn("🔐 LOGIN TK GAME", "rd_login_acc"))
+        kb.add(_btn("📋 DANH SÁCH ACC", "rd_list"), _btn("➖ XOÁ TÀI KHOẢN", "rd_delacc"))
+        kb.add(_btn("📡 TELE NGUỒN", "tele_panel"), _btn("🔑 TẠO KEY VIP", "key_panel"))
+        kb.add(_btn("📄 XUẤT TOKEN", "export_tokens"), _btn("📊 XUẤT LỊCH SỬ", "export_history"))
+        kb.add(_btn("💎 BẢNG GIÁ & SRC", "pricing_info"), _btn("🛟 HỖ TRỢ ADMIN", "support_info"))
+    elif check_auth(cid):
+        kb.add(_btn("🔐 LOGIN TK GAME", "user_login_acc"), _btn("📋 DS ACC CỦA TÔI", "user_my_accs"))
+        kb.add(_btn("➖ XOÁ ACC CỦA TÔI", "user_del_acc"), _btn("🔑 NHẬP KEY MỚI", "nhapkey"))
+        kb.add(_btn("💎 BẢNG GIÁ VIP", "pricing_info"), _btn("💻 MUA SOURCE BOT", "source_info"))
+        kb.add(_btn("🛟 HỖ TRỢ 24/7", "support_info"), _btn("🔄 LÀM MỚI MENU", "home"))
+    else:
+        kb.add(_btn("🔑 KÍCH HOẠT KEY VIP", "nhapkey"), _btn("💎 BẢNG GIÁ DỊCH VỤ", "pricing_info"))
+        kb.add(_btn("💻 MUA SOURCE BOT (30K)", "source_info"), _btn("🛟 LIÊN HỆ ADMIN", "support_info"))
+        kb.add(_btn("🔄 LÀM MỚI", "home"))
+    return kb
+
+def redeem_menu():
+    kb = telebot.types.InlineKeyboardMarkup(row_width=2)
+    toggle = "🟢 ĐANG BẬT (BẤM TẮT)" if redeem_state.get("enabled") else "🔴 ĐANG TẮT (BẤM BẬT)"
+    kb.add(_btn(toggle, "rd_toggle"), _btn("📡 SET CHANNEL", "rd_setchannel"))
+    kb.add(_btn("🔐 LOGIN TK (AUTO NICK)", "rd_login_acc"), _btn("📋 DANH SÁCH ACC", "rd_list"))
+    kb.add(_btn("➖ XOÁ TÀI KHOẢN", "rd_delacc"), _btn("🔄 CẬP NHẬT SỐ DƯ", "rd_refresh"))
+    kb.add(_btn("⬅️ QUAY LẠI MENU", "home"))
+    return kb
+
+def tele_menu():
+    kb = telebot.types.InlineKeyboardMarkup(row_width=2)
+    kb.add(_btn("🔐 ĐĂNG NHẬP TELE", "tele_login"), _btn("🔑 XUẤT SESSION & INFO", "tele_export_session"))
+    kb.add(_btn("📊 KIỂM TRA TRẠNG THÁI", "tele_status_btn"), _btn("🗑️ ĐĂNG XUẤT SESSION", "tele_logout_confirm"))
+    kb.add(_btn("⬅️ QUAY LẠI MENU", "home"))
+    return kb
+
+def key_manage_menu():
+    kb = telebot.types.InlineKeyboardMarkup(row_width=2)
+    kb.add(_btn("🎟️ TẠO KEY 2 NGÀY (10K)", "gen_key_2"), _btn("🎟️ TẠO KEY 5 NGÀY (20K)", "gen_key_5"))
+    kb.add(_btn("✏️ NHẬP SỐ NGÀY KHÁC", "create_key_custom"), _btn("📋 DS KEY CHƯA DÙNG", "list_keys"))
+    kb.add(_btn("⬅️ QUAY LẠI MENU", "home"))
+    return kb
+
+# ========================= XUẤT FILE TXT =========================
+def send_tokens_txt(chat_id):
+    if chat_id != ADMIN_ID:
+        return
+    sync_redeem_accounts()
+    if not REDEEM_ACCOUNTS and not game_accounts:
+        return bot.send_message(chat_id, "📭 Chưa có tài khoản hoặc token nào để xuất.")
+
+    lines = [
+        "========================================================================",
+        "              LỤM CODE LC79 - DANH SÁCH TOKEN TÀI KHOẢN",
+        "========================================================================",
+        f"Thời gian xuất : {datetime.now():%d/%m/%Y %H:%M:%S}",
+        f"Tổng tài khoản : {len(REDEEM_ACCOUNTS)}",
+        "========================================================================\n"
+    ]
+    token_map = {str(v.get("username", "")).lower(): v.get("token", "") for v in game_accounts.values()}
+
+    for i, acc in enumerate(REDEEM_ACCOUNTS, 1):
+        if not acc.is_token_valid():
+            acc.refresh_token()
+        tok = acc.jwt or token_map.get(acc.un.lower(), "CHƯA CÓ TOKEN")
+        lines.append(
+            f"[{i}] Nickname: {acc.nick} | Username: {acc.un} | Số dư: {acc.balance:,}\n"
+            f"Token: {tok}\n"
+            + "-" * 72
+        )
+
+    bio = io.BytesIO("\n".join(lines).encode("utf-8"))
+    bio.name = f"LumCodeLC79_Tokens_{datetime.now():%Y%m%d_%H%M%S}.txt"
+    return bot.send_document(
+        chat_id, bio,
+        caption=f"📄 <b>XUẤT TOKEN THÀNH CÔNG</b>\n👥 Tổng cộng: <b>{len(REDEEM_ACCOUNTS)}</b> tài khoản",
+        parse_mode="HTML"
+    )
+
+def send_full_history_txt(chat_id):
+    if chat_id != ADMIN_ID:
+        return
+    if not redeem_logs:
+        return bot.send_message(chat_id, "📭 Chưa có dữ liệu lịch sử redeem nào.")
+
+    ok_count = sum(1 for x in redeem_logs if x.get("status") == "SUCCESS")
+    fail_count = len(redeem_logs) - ok_count
+    total_money = sum(int(x.get("amount", 0) or 0) for x in redeem_logs if x.get("status") == "SUCCESS")
+
+    lines = [
+        "========================================================================",
+        "             LỤM CODE LC79 - LỊCH SỬ REDEEM FULL THÔNG TIN",
+        "========================================================================",
+        f"Thời gian xuất  : {datetime.now():%d/%m/%Y %H:%M:%S}",
+        f"Tổng lượt chạy  : {len(redeem_logs)}",
+        f"Thành công      : {ok_count}",
+        f"Thất bại        : {fail_count}",
+        f"Tổng tiền nhận  : {total_money:,} VNĐ",
+        "========================================================================\n"
+    ]
+    for i, item in enumerate(redeem_logs, 1):
+        lines.append(
+            f"[{i}] Thời gian   : {item.get('time', '')}\n"
+            f"    Mã Code     : {item.get('code', '')}\n"
+            f"    Tài khoản   : {item.get('account', '')}\n"
+            f"    Số dư trước : {int(item.get('balance_before', 0) or 0):,}\n"
+            f"    Số dư sau   : {int(item.get('balance_after', 0) or 0):,}\n"
+            f"    Tiền nhận   : +{int(item.get('amount', 0) or 0):,}\n"
+            f"    Trạng thái  : {item.get('status', '')}\n"
+            + "-" * 72
+        )
+
+    bio = io.BytesIO("\n".join(lines).encode("utf-8"))
+    bio.name = f"LumCodeLC79_LichSuFull_{datetime.now():%Y%m%d_%H%M%S}.txt"
+    return bot.send_document(
+        chat_id, bio,
+        caption=(
+            f"📊 <b>XUẤT LỊCH SỬ REDEEM FULL</b>\n"
+            f"📝 Tổng lượt: <b>{len(redeem_logs)}</b> | ✅ OK: <b>{ok_count}</b>\n"
+            f"💰 Tổng tiền nhận: <b>{total_money:,}</b>"
+        ),
+        parse_mode="HTML"
+    )
+
+# ========================= HANDLERS CHÍNH =========================
+@bot.message_handler(commands=['start', 'menu'])
+def cmd_start(m):
     cid = m.chat.id
-    bot.reply_to(m, account_text(cid, get_state(cid)))
+    user_flows.pop(cid, None)
+    try:
+        bot.delete_message(cid, m.message_id)
+    except Exception:
+        pass
+    old_id = SCREEN_MESSAGES.get(cid)
+    if old_id:
+        try:
+            bot.delete_message(cid, old_id)
+        except Exception:
+            pass
+    header = build_home_header(m.from_user, cid)
+    msg = bot.send_message(cid, header, parse_mode="HTML", reply_markup=main_menu(cid), disable_web_page_preview=True)
+    SCREEN_MESSAGES[cid] = msg.message_id
 
+@bot.callback_query_handler(func=lambda c: True)
+def cb(c):
+    global REDEEM_ACCOUNTS
+    cid = c.message.chat.id
+    data = c.data
+    try:
+        bot.answer_callback_query(c.id)
+    except Exception:
+        pass
+
+    def go(text, kb=None, mode="HTML"):
+        return replace_screen(cid, c.message.message_id, text, kb, mode)
+
+    if data in ("home", "flow_cancel"):
+        user_flows.pop(cid, None)
+        return go(build_home_header(c.from_user, cid), main_menu(cid), "HTML")
+
+    # --- BẢNG GIÁ, MÃ NGUỒN & HỖ TRỢ ---
+    if data == "pricing_info":
+        txt = (
+            f"╔════════════════════════╗\n"
+            f"   💎 <b>BẢNG GIÁ KEY & SOURCE</b>\n"
+            f"╚════════════════════════╝\n\n"
+            f"🎟️ <b>Gói Key VIP 2 Ngày:</b> <code>10.000đ</code>\n"
+            f"🎟️ <b>Gói Key VIP 5 Ngày:</b> <code>20.000đ</code>\n"
+            f"💻 <b>Full Mã Nguồn Bot (All Src):</b> <code>30.000đ</code>\n\n"
+            f"⚡ <i>Key dạng 10 ký tự ngẫu nhiên, kích hoạt tự động 24/7.</i>\n"
+            f"📩 <b>Liên hệ Admin để mua Key / Source:</b> {SUPPORT_HANDLE}"
+        )
+        return go(txt, main_menu(cid))
+
+    if data == "source_info":
+        txt = (
+            f"╔════════════════════════╗\n"
+            f"   💻 <b>MÃ NGUỒN BOT (ALL SRC)</b>\n"
+            f"╚════════════════════════╝\n\n"
+            f"💰 <b>Giá trọn bộ Full Source:</b> <code>30.000đ</code>\n"
+            f"✨ <b>Tính năng bao gồm:</b>\n"
+            f"  • Full source code Python tối ưu đa luồng\n"
+            f"  • Auto bắt code Tele & cắt tiền tố LC79 thông minh\n"
+            f"  • Bắn đồng loạt nhiều acc (10 luồng/acc) không trễ\n"
+            f"  • Hệ thống Key VIP 10 ký tự & UI chuyên nghiệp\n\n"
+            f"📩 <b>Liên hệ Admin ngay để sở hữu:</b> {SUPPORT_HANDLE}"
+        )
+        return go(txt, main_menu(cid))
+
+    if data == "support_info":
+        txt = (
+            f"╔════════════════════════╗\n"
+            f"   🛟 <b>TRUNG TÂM HỖ TRỢ</b>\n"
+            f"╚════════════════════════╝\n\n"
+            f"👨‍💻 <b>Admin hỗ trợ trực tiếp:</b> {SUPPORT_HANDLE}\n"
+            f"📌 Hỗ trợ mua Key (10k/2N - 20k/5N), mua Full Source Bot (30k) và xử lý lỗi 24/7."
+        )
+        return go(txt, main_menu(cid))
+
+    if data == "nhapkey":
+        return flow_prompt(
+            cid, c.message.message_id, "key",
+            "🔑 <b>KÍCH HOẠT KEY VIP</b>",
+            f"Gửi mã Key VIP (10 ký tự) của bạn vào đây.\nChưa có key? Liên hệ {SUPPORT_HANDLE}"
+        )
+
+    # --- CHỨC NĂNG DÀNH RIÊNG CHO USER ---
+    if data == "user_login_acc":
+        if not check_auth(cid):
+            return go("🔒 <b>Bạn chưa kích hoạt Key VIP!</b>\nVui lòng nhập Key để sử dụng.", main_menu(cid))
+        return flow_prompt(
+            cid, c.message.message_id, "user_login_game",
+            "🔐 <b>LOGIN TÀI KHOẢN GAME</b>",
+            "Gửi theo mẫu: <code>TÀI_KHOẢN MẬT_KHẨU</code>\n"
+            "✨ <i>Hệ thống tự động lấy Nickname & đưa vào danh sách săn code của Admin.</i>"
+        )
+
+    if data == "user_my_accs":
+        if not check_auth(cid):
+            return go("🔒 <b>Bạn chưa kích hoạt Key VIP!</b>", main_menu(cid))
+        sync_redeem_accounts()
+        my_accs = [a for a in REDEEM_ACCOUNTS if a.owner == cid]
+        if not my_accs:
+            return go("📭 <b>Bạn chưa thêm tài khoản game nào.</b>\nBấm <b>Login TK Game</b> để thêm ngay!", main_menu(cid))
+        lines = [
+            f"<b>{i}.</b> 🟢 <b>{html.escape(a.nick)}</b> (<code>{html.escape(a.un)}</code>)\n    💰 Số dư hiện tại: <b>{a.balance:,}</b>"
+            for i, a in enumerate(my_accs, 1)
+        ]
+        return go("📋 <b>DANH SÁCH TÀI KHOẢN CỦA BẠN</b>\n━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines), main_menu(cid))
+
+    if data == "user_del_acc":
+        if not check_auth(cid):
+            return go("🔒 <b>Bạn chưa kích hoạt Key VIP!</b>", main_menu(cid))
+        sync_redeem_accounts()
+        my_accs = [a for a in REDEEM_ACCOUNTS if a.owner == cid]
+        if not my_accs:
+            return go("📭 <b>Bạn không có tài khoản nào để xoá.</b>", main_menu(cid))
+        accs_preview = "\n".join([f"• <code>{html.escape(a.un)}</code> ({html.escape(a.nick)})" for a in my_accs])
+        return flow_prompt(
+            cid, c.message.message_id, "user_del_redeem",
+            "➖ <b>XOÁ TÀI KHOẢN CỦA BẠN</b>",
+            f"Danh sách tài khoản của bạn:\n{accs_preview}\n\nGửi chính xác <b>Username</b> hoặc <b>Nickname</b> muốn xoá."
+        )
+
+    # --- CHỨC NĂNG DÀNH RIÊNG CHO ADMIN ---
+    if cid != ADMIN_ID:
+        return go("⛔ <b>Chức năng này chỉ dành cho Quản Trị Viên!</b>", main_menu(cid))
+
+    if data == "rd_panel":
+        sync_redeem_accounts()
+        status_str = "🟢 ĐANG BẬT" if redeem_state.get("enabled") else "🔴 ĐANG TẮT"
+        ch_name = html.escape(redeem_state.get("channel_name") or "Chưa thiết lập")
+        txt = (
+            f"╔════════════════════════╗\n"
+            f"   ⚡ <b>BẢNG ĐIỀU KHIỂN AUTO REDEEM</b>\n"
+            f"╚════════════════════════╝\n"
+            f"🔔 <b>Trạng thái:</b> {status_str}\n"
+            f"📡 <b>Kênh nguồn:</b> {ch_name}\n"
+            f"👥 <b>Tổng Acc sẵn sàng:</b> <b>{len(REDEEM_ACCOUNTS)}</b> acc\n"
+            f"⚡ <b>Chế độ bắn:</b> Đồng loạt toàn bộ acc (10 luồng/acc)"
+        )
+        return go(txt, redeem_menu())
+
+    if data == "rd_toggle":
+        sync_redeem_accounts()
+        if redeem_state.get("enabled"):
+            redeem_state["enabled"] = False
+        elif not REDEEM_ACCOUNTS:
+            return go("⚠️ <b>Chưa có tài khoản nào!</b> Hãy bấm <b>Login TK</b> trước.", redeem_menu())
+        elif redeem_state.get("channel_id") is None:
+            return go("⚠️ <b>Chưa đặt kênh nhận code!</b> Hãy bấm <b>Set Channel</b> trước.", redeem_menu())
+        else:
+            redeem_state["enabled"] = True
+        save_json(REDEEM_STATE_FILE, redeem_state)
+        status_str = "🟢 ĐANG BẬT" if redeem_state.get("enabled") else "🔴 ĐANG TẮT"
+        ch_name = html.escape(redeem_state.get("channel_name") or "Chưa thiết lập")
+        txt = (
+            f"╔════════════════════════╗\n"
+            f"   ⚡ <b>BẢNG ĐIỀU KHIỂN AUTO REDEEM</b>\n"
+            f"╚════════════════════════╝\n"
+            f"🔔 <b>Trạng thái:</b> {status_str}\n"
+            f"📡 <b>Kênh nguồn:</b> {ch_name}\n"
+            f"👥 <b>Tổng Acc sẵn sàng:</b> <b>{len(REDEEM_ACCOUNTS)}</b> acc\n"
+            f"⚡ <b>Chế độ bắn:</b> Đồng loạt toàn bộ acc (10 luồng/acc)"
+        )
+        return go(txt, redeem_menu())
+
+    if data == "rd_setchannel":
+        return flow_prompt(
+            cid, c.message.message_id, "set_channel",
+            "📡 <b>THIẾT LẬP KÊNH NHẬN CODE</b>",
+            "Gửi <code>@username</code>, link <code>t.me/...</code> hoặc <code>ID kênh</code>."
+        )
+
+    if data == "rd_login_acc":
+        return flow_prompt(
+            cid, c.message.message_id, "admin_login_game",
+            "🔐 <b>LOGIN TK (TỰ ĐỘNG LẤY NICKNAME)</b>",
+            "Gửi theo mẫu: <code>TÀI_KHOẢN MẬT_KHẨU</code>\n"
+            "✨ <i>Không cần nhập Nickname, hệ thống tự đăng nhập lấy tên nhân vật và cập nhật số dư thực tế.</i>"
+        )
+
+    if data == "rd_delacc":
+        sync_redeem_accounts()
+        if not REDEEM_ACCOUNTS:
+            return go("📭 Danh sách tài khoản đang trống.", redeem_menu())
+        return flow_prompt(
+            cid, c.message.message_id, "admin_del_redeem",
+            "➖ <b>XOÁ TÀI KHOẢN REDEEM</b>",
+            "Gửi chính xác <b>Nickname</b> hoặc <b>Username</b> cần xoá khỏi danh sách."
+        )
+
+    if data == "rd_list":
+        sync_redeem_accounts()
+        if not REDEEM_ACCOUNTS:
+            return go("📭 <b>Chưa có tài khoản nào trong danh sách.</b>", redeem_menu())
+        lines = [
+            f"<b>{i}.</b> {'🟢' if a.is_token_valid() else '🟡'} <b>{html.escape(a.nick)}</b> (<code>{html.escape(a.un)}</code>) • 💰 <b>{a.balance:,}</b>"
+            for i, a in enumerate(REDEEM_ACCOUNTS, 1)
+        ]
+        return go("📋 <b>DANH SÁCH TÀI KHOẢN & SỐ DƯ</b>\n━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines), redeem_menu())
+
+    if data == "rd_refresh":
+        sync_redeem_accounts()
+        if not REDEEM_ACCOUNTS:
+            return go("📭 Không có tài khoản nào để cập nhật.", redeem_menu())
+        go("🔄 <b>Đang làm mới Token & cập nhật số dư mới nhất...</b>", redeem_menu())
+
+        def refresh_all_worker():
+            ok = 0
+            for acc in REDEEM_ACCOUNTS:
+                try:
+                    if acc.refresh_token():
+                        ok += 1
+                except Exception:
+                    pass
+            lines = [f"• <b>{html.escape(a.nick)}</b>: 💰 <b>{a.balance:,}</b>" for a in REDEEM_ACCOUNTS]
+            try:
+                bot.send_message(
+                    cid,
+                    f"✅ <b>ĐÃ CẬP NHẬT SỐ DƯ ({ok}/{len(REDEEM_ACCOUNTS)} ACC)</b>\n━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines),
+                    parse_mode="HTML",
+                    reply_markup=redeem_menu()
+                )
+            except Exception:
+                pass
+
+        threading.Thread(target=refresh_all_worker, daemon=True).start()
+        return
+
+    # --- XUẤT TXT ---
+    if data == "export_tokens":
+        send_tokens_txt(cid)
+        return
+
+    if data == "export_history":
+        send_full_history_txt(cid)
+        return
+
+    # --- QUẢN LÝ KEY ---
+    if data == "key_panel":
+        return go(
+            f"╔════════════════════════╗\n"
+            f"   🔑 <b>QUẢN LÝ KEY VIP (10 KÝ TỰ)</b>\n"
+            f"╚════════════════════════╝\n"
+            f"📦 <b>Key đang chờ kích hoạt:</b> <b>{len(valid_keys)}</b> key\n"
+            f"👥 <b>User đang hoạt động:</b> <b>{len(authorized_users)}</b> user\n\n"
+            f"Chọn gói tạo nhanh bên dưới:",
+            key_manage_menu()
+        )
+
+    if data in ("gen_key_2", "gen_key_5"):
+        days = 2 if data == "gen_key_2" else 5
+        price_label = "10.000đ" if days == 2 else "20.000đ"
+        k = generate_vip_key(10)
+        valid_keys[k] = days
+        exp = (datetime.now() + timedelta(days=days)).strftime("%d/%m/%Y %H:%M")
+        return go(
+            f"✅ <b>ĐÃ TẠO KEY VIP THÀNH CÔNG</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔑 <b>Mã Key:</b> <code>{k}</code>\n"
+            f"⏳ <b>Thời hạn:</b> {days} Ngày ({price_label})\n"
+            f"📅 <b>Hết hạn dự kiến:</b> {exp}",
+            key_manage_menu()
+        )
+
+    if data == "create_key_custom":
+        return flow_prompt(cid, c.message.message_id, "create_key", "✏️ <b>TẠO KEY TUỲ CHỈNH</b>", "Nhập số ngày sử dụng (ví dụ: <code>7</code> hoặc <code>30</code>).")
+
+    if data == "list_keys":
+        if not valid_keys:
+            return go("📭 Hiện không có key nào chưa sử dụng.", key_manage_menu())
+        ds = "\n".join([f"• <code>{k}</code> ➔ <b>{v} ngày</b>" for k, v in valid_keys.items()])
+        return go("📋 <b>DANH SÁCH KEY CHƯA SỬ DỤNG</b>\n━━━━━━━━━━━━━━━━━━━━\n" + ds, key_manage_menu())
+
+    # --- TELE NGUỒN ---
+    if data == "tele_panel":
+        me, session_str = get_tele_account_details()
+        if me:
+            full_name = f"{me.first_name or ''} {me.last_name or ''}".strip() or "N/A"
+            uname = f"@{me.username}" if me.username else "Không có"
+            phone = f"+{me.phone}" if getattr(me, "phone", None) else "Ẩn"
+            info_block = (
+                f"🟢 <b>Trạng thái:</b> ONLINE & ĐANG THEO DÕI\n"
+                f"👤 <b>Tên Tele:</b> {html.escape(full_name)}\n"
+                f"🆔 <b>ID Tele:</b> <code>{me.id}</code>\n"
+                f"🔗 <b>Username:</b> {html.escape(uname)}\n"
+                f"📱 <b>SĐT:</b> <code>{html.escape(phone)}</code>"
+            )
+        elif session_str:
+            info_block = "🟡 <b>Trạng thái:</b> Đã lưu Session (Đang chờ kết nối)"
+        else:
+            info_block = "🔴 <b>Trạng thái:</b> Chưa đăng nhập tài khoản Tele nguồn"
+
+        ch_name = html.escape(redeem_state.get("channel_name") or "Chưa thiết lập")
+        return go(
+            f"╔════════════════════════╗\n"
+            f"   📡 <b>QUẢN LÝ TELE NGUỒN</b>\n"
+            f"╚════════════════════════╝\n"
+            f"{info_block}\n"
+            f"📢 <b>Kênh code đang theo dõi:</b> {ch_name}",
+            tele_menu()
+        )
+
+    if data == "tele_login":
+        return flow_prompt(cid, c.message.message_id, "tele_phone", "🔐 <b>ĐĂNG NHẬP TELE NGUỒN</b>", "Gửi số điện thoại kèm mã vùng quốc gia (ví dụ: <code>+849xxxxxxxx</code>).")
+
+    if data == "tele_export_session":
+        me, session_str = get_tele_account_details()
+        if not session_str:
+            return go("❌ <b>Chưa có Session nào được lưu!</b> Vui lòng đăng nhập Tele trước.", tele_menu())
+        if me:
+            full_name = f"{me.first_name or ''} {me.last_name or ''}".strip() or "N/A"
+            uname = f"@{me.username}" if me.username else "Không có"
+            phone = f"+{me.phone}" if getattr(me, "phone", None) else "Ẩn"
+            detail = (
+                f"👤 <b>Tên Tele:</b> {html.escape(full_name)}\n"
+                f"🆔 <b>ID Tele:</b> <code>{me.id}</code>\n"
+                f"🔗 <b>Username:</b> {html.escape(uname)}\n"
+                f"📱 <b>SĐT:</b> <code>{html.escape(phone)}</code>\n"
+            )
+        else:
+            detail = "ℹ️ <b>Thông tin tài khoản:</b> Đã lưu chuỗi phiên đăng nhập\n"
+        return go(
+            f"🔑 <b>THÔNG TIN & SESSION STRING TELE NGUỒN</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{detail}"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📋 <b>Session String (Bấm để sao chép):</b>\n<code>{html.escape(session_str)}</code>",
+            tele_menu()
+        )
+
+    if data == "tele_status_btn":
+        me, session_str = get_tele_account_details()
+        return go(
+            f"📊 <b>TRẠNG THÁI KẾT NỐI TELE</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔑 <b>API ID / HASH:</b> {'✅ Đã cấu hình' if TELETHON_API_ID and TELETHON_API_HASH else '❌ Thiếu biến môi trường'}\n"
+            f"💾 <b>Session String:</b> {'✅ Đã lưu' if session_str else '❌ Chưa có'}\n"
+            f"🟢 <b>Client Online:</b> {'✅ Đang hoạt động' if tele_ready else '🔴 Ngoại tuyến'}\n"
+            f"📡 <b>Kênh code:</b> {html.escape(redeem_state.get('channel_name') or 'Chưa đặt')}",
+            tele_menu()
+        )
+
+    if data == "tele_logout_confirm":
+        kb = telebot.types.InlineKeyboardMarkup(row_width=2)
+        kb.add(_btn("🗑️ XÁC NHẬN XOÁ", "tele_logout_yes"), _btn("↩️ QUAY LẠI", "tele_panel"))
+        return go("⚠️ <b>Bạn có chắc muốn xoá Session Tele nguồn hiện tại?</b>", kb)
+
+    if data == "tele_logout_yes":
+        if os.path.exists(TELE_SESSION_FILE):
+            os.remove(TELE_SESSION_FILE)
+        return go("✅ <b>Đã xoá Session Tele nguồn.</b>", tele_menu())
+
+# ========================= XỬ LÝ NHẬP LIỆU TỪ CHAT =========================
+@bot.message_handler(func=lambda m: bool(m and m.chat and m.chat.id in user_flows), content_types=['text'])
+def handle_menu_input(m):
+    global REDEEM_ACCOUNTS
+    cid = m.chat.id
+    flow = user_flows.get(cid, {}).get("step")
+    value = (m.text or "").strip()
+
+    try:
+        bot.delete_message(cid, m.message_id)
+    except Exception:
+        pass
+
+    if value.lower() in ("huy", "huỷ", "cancel", "/cancel"):
+        user_flows.pop(cid, None)
+        return bot.send_message(cid, "↩️ Đã huỷ thao tác.", reply_markup=main_menu(cid))
+
+    # 1. Kích hoạt Key VIP
+    if flow == "key":
+        key = value.upper()
+        if key in valid_keys:
+            days = valid_keys.pop(key)
+            authorized_users[cid] = time.time() + days * 86400
+            user_flows.pop(cid, None)
+            exp = datetime.fromtimestamp(authorized_users[cid]).strftime("%d/%m/%Y %H:%M")
+            return bot.send_message(
+                cid,
+                f"🎉 <b>KÍCH HOẠT KEY VIP THÀNH CÔNG!</b>\n"
+                f"⏳ <b>Thời hạn:</b> {days} Ngày (Đến {exp})\n"
+                f"👇 <i>Bấm nút bên dưới để mở Menu sử dụng:</i>",
+                parse_mode="HTML",
+                reply_markup=main_menu(cid)
+            )
+        return bot.send_message(cid, f"❌ <b>Key không hợp lệ hoặc đã sử dụng!</b>\nLiên hệ {SUPPORT_HANDLE} để mua key.", parse_mode="HTML", reply_markup=main_menu(cid))
+
+    # 2. Login TK Game (User hoặc Admin) - Không cần Nickname
+    if flow in ("user_login_game", "admin_login_game"):
+        is_admin_flow = (flow == "admin_login_game")
+        if is_admin_flow and cid != ADMIN_ID:
+            user_flows.pop(cid, None)
+            return
+        if not is_admin_flow and not check_auth(cid):
+            user_flows.pop(cid, None)
+            return bot.send_message(cid, "🔒 Key của bạn đã hết hạn.", reply_markup=main_menu(cid))
+
+        parts = value.split(maxsplit=1)
+        if len(parts) != 2:
+            return bot.send_message(cid, "⚠️ <b>Sai định dạng!</b> Vui lòng gửi: <code>TÀI_KHOẢN MẬT_KHẨU</code>", parse_mode="HTML")
+
+        un, pw = parts[0].strip(), parts[1].strip()
+        status_msg = bot.send_message(cid, f"🔄 <b>Đang đăng nhập tài khoản</b> <code>{html.escape(un)}</code>...", parse_mode="HTML")
+
+        def do_login_task():
+            res = login_and_get_info(un, pw)
+            if "_error" in res:
+                try:
+                    bot.edit_message_text(
+                        f"❌ <b>Đăng nhập thất bại:</b> {html.escape(res['_error'])}",
+                        cid, status_msg.message_id, parse_mode="HTML",
+                        reply_markup=redeem_menu() if is_admin_flow else main_menu(cid)
+                    )
+                except Exception:
+                    pass
+                return
+
+            nick = res["nickname"]
+            money = res["money"]
+            save_game_account(cid, un, nick, res["token"], money, source="admin" if is_admin_flow else "user")
+            upsert_redeem_account(un, res["pw_hashed"], nick, owner_id=cid, balance=money)
+            user_flows.pop(cid, None)
+
+            try:
+                bot.edit_message_text(
+                    f"✅ <b>ĐĂNG NHẬP & ĐỒNG BỘ THÀNH CÔNG!</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"👤 <b>Nickname (Tự động):</b> <b>{html.escape(nick)}</b>\n"
+                    f"🔑 <b>Tài khoản:</b> <code>{html.escape(un)}</code>\n"
+                    f"💰 <b>Số dư hiện tại:</b> <b>{money:,}</b>\n"
+                    f"⚡ <b>Trạng thái:</b> Đã sẵn sàng lụm code!",
+                    cid, status_msg.message_id, parse_mode="HTML",
+                    reply_markup=redeem_menu() if is_admin_flow else main_menu(cid)
+                )
+            except Exception:
+                pass
+
+        threading.Thread(target=do_login_task, daemon=True).start()
+        return
+
+    # 3. Xoá tài khoản (User chỉ xoá acc của mình, Admin xoá mọi acc)
+    if flow in ("user_del_redeem", "admin_del_redeem"):
+        is_admin_flow = (flow == "admin_del_redeem")
+        if is_admin_flow and cid != ADMIN_ID:
+            user_flows.pop(cid, None)
+            return
+
+        target = value.lower()
+        new_list = []
+        removed = []
+        for acc in redeem_state.get("accounts", []):
+            match = acc.get("un", "").lower() == target or acc.get("nick", "").lower() == target
+            can_remove = is_admin_flow or (acc.get("owner") == cid)
+            if match and can_remove:
+                removed.append(acc.get("nick") or acc.get("un"))
+            else:
+                new_list.append(acc)
+
+        if not removed:
+            return bot.send_message(
+                cid,
+                "❌ <b>Không tìm thấy tài khoản phù hợp!</b> Hãy kiểm tra lại tên và gửi lại.",
+                parse_mode="HTML",
+                reply_markup=redeem_menu() if is_admin_flow else main_menu(cid)
+            )
+
+        redeem_state["accounts"] = new_list
+        save_json(REDEEM_STATE_FILE, redeem_state)
+        REDEEM_ACCOUNTS = build_redeem_accounts()
+        user_flows.pop(cid, None)
+        return bot.send_message(
+            cid,
+            f"🗑️ <b>Đã xoá thành công:</b> {', '.join(removed)}",
+            parse_mode="HTML",
+            reply_markup=redeem_menu() if is_admin_flow else main_menu(cid)
+        )
+
+    # 4. Admin tạo Key tuỳ chỉnh
+    if flow == "create_key" and cid == ADMIN_ID:
+        try:
+            days = int(value)
+            if not 1 <= days <= 3650:
+                raise ValueError
+        except ValueError:
+            return bot.send_message(cid, "⚠️ Vui lòng nhập số ngày hợp lệ (từ 1 đến 3650).")
+        k = generate_vip_key(10)
+        valid_keys[k] = days
+        user_flows.pop(cid, None)
+        exp = (datetime.now() + timedelta(days=days)).strftime("%d/%m/%Y %H:%M")
+        return bot.send_message(
+            cid,
+            f"✅ <b>ĐÃ TẠO KEY VIP</b>\n🔑 <code>{k}</code>\n⏳ Thời hạn: {days} Ngày (Đến {exp})",
+            parse_mode="HTML",
+            reply_markup=key_manage_menu()
+        )
+
+    # 5. Admin Set Channel
+    if flow == "set_channel" and cid == ADMIN_ID:
+        target = value
+        if "t.me/" in target:
+            target = target.split("t.me/")[-1].strip("/").split("?")[0]
+        if not target.startswith("@") and not target.lstrip("-").isdigit():
+            target = "@" + target
+        status_msg = bot.send_message(cid, f"🔄 Đang kết nối tới kênh <code>{html.escape(target)}</code>...", parse_mode="HTML")
+
+        def resolve_ch():
+            try:
+                entity = tele_resolve_entity(target)
+                peer_id = utils.get_peer_id(entity)
+                redeem_state["channel_id"] = peer_id
+                redeem_state["channel_name"] = getattr(entity, "title", None) or target
+                save_json(REDEEM_STATE_FILE, redeem_state)
+                user_flows.pop(cid, None)
+                bot.edit_message_text(
+                    f"✅ <b>ĐÃ ĐẶT KÊNH NHẬN CODE</b>\n📡 Tên kênh: <b>{html.escape(redeem_state['channel_name'])}</b>\n🆔 ID: <code>{peer_id}</code>",
+                    cid, status_msg.message_id, parse_mode="HTML", reply_markup=redeem_menu()
+                )
+            except Exception as exc:
+                bot.edit_message_text(
+                    f"❌ <b>Lỗi đặt kênh:</b> {html.escape(str(exc))}\n💡 Hãy chắc chắn đã đăng nhập Tele nguồn.",
+                    cid, status_msg.message_id, parse_mode="HTML", reply_markup=redeem_menu()
+                )
+
+        threading.Thread(target=resolve_ch, daemon=True).start()
+        return
+
+    # 6. Admin đăng nhập Tele nguồn (SĐT -> OTP -> 2FA)
+    if flow == "tele_phone" and cid == ADMIN_ID:
+        if not TELETHON_API_ID or not TELETHON_API_HASH:
+            user_flows.pop(cid, None)
+            return bot.send_message(cid, "❌ Thiếu TELETHON_API_ID hoặc TELETHON_API_HASH.", reply_markup=tele_menu())
+        status_msg = bot.send_message(cid, "📲 Đang gửi mã xác minh OTP Telegram...")
+
+        def send_otp_task():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                client = TelegramClient(StringSession(), TELETHON_API_ID, TELETHON_API_HASH, loop=loop)
+                loop.run_until_complete(client.connect())
+                sent = loop.run_until_complete(client.send_code_request(value))
+                tele_login_pending.update({"phone": value, "hash": sent.phone_code_hash, "client": client, "loop": loop})
+                user_flows[cid] = {"step": "tele_otp"}
+                bot.edit_message_text("📲 <b>Đã gửi OTP!</b> Vui lòng nhập mã OTP vào khung chat:", cid, status_msg.message_id, parse_mode="HTML")
+            except Exception as exc:
+                user_flows.pop(cid, None)
+                bot.edit_message_text(f"❌ Lỗi gửi OTP: {html.escape(str(exc))}", cid, status_msg.message_id, parse_mode="HTML", reply_markup=tele_menu())
+
+        threading.Thread(target=send_otp_task, daemon=True).start()
+        return
+
+    if flow == "tele_otp" and cid == ADMIN_ID:
+        pending = tele_login_pending
+        if not pending.get("client"):
+            user_flows.pop(cid, None)
+            return bot.send_message(cid, "❌ Phiên OTP đã hết hạn.", reply_markup=tele_menu())
+        status_msg = bot.send_message(cid, "🔐 Đang xác thực mã OTP...")
+
+        def verify_otp_task():
+            client, loop = pending["client"], pending["loop"]
+            try:
+                loop.run_until_complete(client.sign_in(phone=pending["phone"], code=value, phone_code_hash=pending["hash"]))
+                _save_tele_session(client.session.save())
+                tele_login_pending.clear()
+                user_flows.pop(cid, None)
+                bot.edit_message_text("✅ <b>Đăng nhập Tele thành công!</b> Đang bật canh kênh...", cid, status_msg.message_id, parse_mode="HTML", reply_markup=tele_menu())
+                _activate_telethon_client(client, loop)
+            except Exception as exc:
+                if "SessionPasswordNeeded" in type(exc).__name__ or "password" in str(exc).lower():
+                    user_flows[cid] = {"step": "tele_password"}
+                    bot.edit_message_text("🔐 <b>Tài khoản có bật 2FA.</b> Vui lòng nhập mật khẩu 2FA:", cid, status_msg.message_id, parse_mode="HTML")
+                else:
+                    bot.edit_message_text(f"❌ Lỗi OTP: {html.escape(str(exc))}", cid, status_msg.message_id, parse_mode="HTML", reply_markup=tele_menu())
+
+        threading.Thread(target=verify_otp_task, daemon=True).start()
+        return
+
+    if flow == "tele_password" and cid == ADMIN_ID:
+        pending = tele_login_pending
+        status_msg = bot.send_message(cid, "🔐 Đang xác thực mật khẩu 2FA...")
+
+        def verify_2fa_task():
+            try:
+                client, loop = pending["client"], pending["loop"]
+                loop.run_until_complete(client.sign_in(password=value))
+                _save_tele_session(client.session.save())
+                tele_login_pending.clear()
+                user_flows.pop(cid, None)
+                bot.edit_message_text("✅ <b>Đăng nhập Tele 2FA thành công!</b> Đang bật canh kênh...", cid, status_msg.message_id, parse_mode="HTML", reply_markup=tele_menu())
+                _activate_telethon_client(client, loop)
+            except Exception as exc:
+                bot.edit_message_text(f"❌ Sai mật khẩu 2FA: {html.escape(str(exc))}", cid, status_msg.message_id, parse_mode="HTML", reply_markup=tele_menu())
+
+        threading.Thread(target=verify_2fa_task, daemon=True).start()
+        return
+
+    user_flows.pop(cid, None)
+    return bot.send_message(cid, "⚠️ Phiên thao tác đã kết thúc.", reply_markup=main_menu(cid))
+
+def init_redeem_tokens():
+    if not REDEEM_ACCOUNTS:
+        return
+    for acc in REDEEM_ACCOUNTS:
+        try:
+            acc.refresh_token()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
-    log.info("%s khởi động", BOT_NAME)
-    bot.infinity_polling()
+    threading.Thread(target=init_redeem_tokens, daemon=True).start()
+    if TELETHON_API_ID and TELETHON_API_HASH:
+        threading.Thread(target=_start_telethon_listener, daemon=True).start()
+    logger.info("✨ LỤM CODE LC79 - HỆ THỐNG SẴN SÀNG ✨")
+
+    if bot:
+        while True:
+            try:
+                bot.infinity_polling(timeout=20, long_polling_timeout=30)
+            except Exception as e:
+                logger.error(f"Bot crashed: {e}")
+                time.sleep(5)
+    else:
+        while True:
+            time.sleep(60)
