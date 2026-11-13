@@ -3,6 +3,7 @@ import math
 import json
 import base64
 import hashlib
+import html
 import logging
 import random
 import string
@@ -73,21 +74,21 @@ TAI_LABEL, XIU_LABEL = "TÀI", "XỈU"
 MODES = {
     "antoan":   {"label": "🟢 AN TOÀN",  "post": 0.97, "min_sessions": 80},
     "canbang":  {"label": "🟡 CÂN BẰNG", "post": 0.92, "min_sessions": 50},
-    "maohiem":  {"label": "🔴 MẠO HIỂM", "post": 0.85, "min_sessions": 30},
+    "maohiem":  {"label": "🔴 MẠO HIỂM", "post": 0.0, "min_sessions": 1, "never_skip": True},
 }
 DEFAULT_MODE = "canbang"
 
 bot.set_my_commands([
     telebot.types.BotCommand("batdau", "🏠 Giới thiệu và trạng thái"),
     telebot.types.BotCommand("trogiup", "📖 Hướng dẫn đầy đủ"),
-    telebot.types.BotCommand("nhapkey", "🔑 nhapkey MÃ_KEY"),
-    telebot.types.BotCommand("dangnhap", "🔐 dangnhap TÀI_KHOẢN MẬT_KHẨU"),
-    telebot.types.BotCommand("tudong", "⚡ tudong bat [tiền] | tat"),
-    telebot.types.BotCommand("x2", "💸 x2 bat | tat"),
-    telebot.types.BotCommand("caidat", "⚙️ caidat cuoc= sl= sw= limit= mode= thongbao="),
+    telebot.types.BotCommand("nhapkey", "🔑 /nhapkey MÃ_KEY"),
+    telebot.types.BotCommand("dangnhap", "🔐 /dangnhap TÀI_KHOẢN MẬT_KHẨU"),
+    telebot.types.BotCommand("tudong", "⚡ /tudong bat [tiền] | tat"),
+    telebot.types.BotCommand("x2", "💸 /x2 bat | tat"),
+    telebot.types.BotCommand("caidat", "⚙️ /caidat cuoc= sl= sw= limit= mode= thongbao="),
     telebot.types.BotCommand("thongtin", "💎 Tài khoản và thống kê"),
     telebot.types.BotCommand("dung", "⏹️ Ngắt kết nối an toàn"),
-    telebot.types.BotCommand("taokey", "👑 taokey [số_ngày] (ADMIN)"),
+    telebot.types.BotCommand("taokey", "👑 /taokey [số_ngày] (ADMIN)"),
     telebot.types.BotCommand("danhsachkey", "📋 Danh sách key (ADMIN)"),
 ])
 
@@ -241,51 +242,51 @@ class CauEngine:
 
     def predict(self, mode=DEFAULT_MODE):
         cfg = MODES.get(mode, MODES[DEFAULT_MODE])
+        never_skip = cfg.get("never_skip", False)
         seq = self.results()
         n = len(seq)
-        base_out = {"side": None, "p": 0.5, "post": 0.5, "n_eff": 0.0, "ev": 0.0,
-                    "reason": "", "agree": True, "ctx": "Markov 1→2→3 (backoff)"}
-        if n < cfg["min_sessions"]:
-            base_out["reason"] = f"Cần ít nhất {cfg['min_sessions']} phiên, đang có {n}"
-            return base_out
+        out = {"side": None, "p": 0.5, "post": 0.5, "n_eff": 0.0, "ev": 0.0,
+               "reason": "", "agree": True, "ctx": "Markov 1→2→3 · backoff"}
+        if n < cfg["min_sessions"] and not never_skip:
+            out["reason"] = f"Cần ít nhất {cfg['min_sessions']} phiên, đang có {n}"
+            return out
 
         p_f, n_f = self._estimate(seq, self.HALF_LIFE_FAST)
         p_s, n_s = self._estimate(seq, self.HALF_LIFE_SLOW)
-        side_f = TAI if p_f >= 0.5 else XIU
-        side_s = TAI if p_s >= 0.5 else XIU
         p_tai = (p_f + p_s) / 2
         n_eff = (n_f + n_s) / 2
-        base_out["p"] = p_tai
-        base_out["n_eff"] = n_eff
-
-        if side_f != side_s:
-            base_out["agree"] = False
-            base_out["reason"] = "Hai mô hình nhanh và chậm không đồng thuận"
-            self.skips += 1
-            return base_out
-
+        agree = (p_f >= 0.5) == (p_s >= 0.5)
         side = TAI if p_tai >= 0.5 else XIU
         p_side = max(p_tai, 1 - p_tai)
-        a = p_tai * n_eff + 1
-        b = (1 - p_tai) * n_eff + 1
-        post_tai = beta_prob_above(a, b)
+        post_tai = beta_prob_above(p_tai * n_eff + 1, (1 - p_tai) * n_eff + 1)
         post = post_tai if side == TAI else 1 - post_tai
         ev_unit = p_side * WIN_PROFIT - (1 - p_side) * LOSE_LOSS
-        need = cfg["post"] + self.extra_post
+        out.update({"p": p_tai, "n_eff": n_eff, "post": post, "ev": ev_unit, "agree": agree})
 
-        base_out.update({"post": post, "ev": ev_unit})
+        if never_skip:
+            out["side"] = side
+            out["reason"] = ("Hai mô hình đồng thuận" if agree
+                             else "Hai mô hình lệch, lấy trung bình của cả hai")
+            if n < cfg["min_sessions"]:
+                out["reason"] += f" · mới có {n} phiên"
+            return out
+
+        need = cfg["post"] + self.extra_post
+        if not agree:
+            self.skips += 1
+            out["reason"] = "Hai mô hình nhanh và chậm không đồng thuận"
+            return out
         if post < need:
             self.skips += 1
-            base_out["reason"] = f"Độ chắc chắn {post:.1%} dưới ngưỡng {need:.1%}"
-            return base_out
+            out["reason"] = f"Độ chắc chắn {post:.1%} dưới ngưỡng {need:.1%}"
+            return out
         if ev_unit <= 0:
             self.skips += 1
-            base_out["reason"] = "Kỳ vọng âm, bỏ qua"
-            return base_out
-
-        base_out["side"] = side
-        base_out["reason"] = f"Đồng thuận hai mô hình, độ chắc chắn {post:.1%}"
-        return base_out
+            out["reason"] = "Kỳ vọng âm, bỏ qua"
+            return out
+        out["side"] = side
+        out["reason"] = f"Đồng thuận hai mô hình, độ chắc chắn {post:.1%}"
+        return out
 
     def record(self, pred, p_side, actual):
         if pred is None:
@@ -379,7 +380,7 @@ def notify(cid, text, force=False):
     if not (force or st["notify"]):
         return
     try:
-        bot.send_message(cid, text)
+        bot.send_message(cid, text, parse_mode="HTML")
     except Exception as e:
         log.warning("Không gửi được tin cho %s: %s", cid, e)
 
@@ -390,53 +391,60 @@ def notify(cid, text, force=False):
 LINE = "━━━━━━━━━━━━━━━━━━━━"
 
 
+def esc(s):
+    return html.escape(str(s), quote=False)
+
+
 def prediction_card(sid, info, st):
-    recent = trail(st["engine"].results(), 10)
-    head = f"🎯 DỰ ĐOÁN PHIÊN #{sid}"
+    mode = MODES[st["mode"]]
+    recent = trail(st["engine"].results(), 10) or "—"
+    head = f"🎯 <b>DỰ ĐOÁN PHIÊN #{sid}</b>"
     if info["side"] is None:
-        return (f"{head}\n{LINE}\n"
-                f"🚫 BỎ QUA PHIÊN NÀY\n"
-                f"📋 {info['reason']}\n{LINE}\n"
-                f"🧾 10 phiên gần nhất: {recent}\n"
-                f"🧠 Chỉ đánh khi có bằng chứng thống kê đủ mạnh")
+        return (f"{head}\n{mode['label']}\n{LINE}\n"
+                f"🚫 <b>BỎ QUA PHIÊN NÀY</b>\n"
+                f"📋 {esc(info['reason'])}\n{LINE}\n"
+                f"🧾 {recent}")
 
     side = info["side"]
     p_side = info["p"] if side == TAI else 1 - info["p"]
     bet = current_bet(st)
-    win_amt = bet * WIN_PROFIT
-    ev_amt = bet * info["ev"]
-    mode = MODES[st["mode"]]
     x2 = f"X2 cấp {st['mart_level']}/{MAX_MARTINGALE_LEVEL}" if st["martingale"] else "Mức gốc"
-    return (f"{head}\n{LINE}\n"
-            f"🤖 DỰ ĐOÁN: {side_label(side)} {'⚫' if side == TAI else '⚪'}\n"
-            f"📈 Xác suất ước lượng: {p_side:.1%}\n"
-            f"   {bar(p_side)}\n"
-            f"🛡️ Độ chắc chắn: {info['post']:.1%}  (ngưỡng {mode['post']:.0%})\n"
-            f"📚 Mẫu hiệu dụng: {info['n_eff']:.1f} · Phiên đã nạp: {len(st['engine'].recs)}\n"
+    extra = "\n🔥 Đánh mọi phiên, không bỏ phiên nào" if mode.get("never_skip") else ""
+    return (f"{head}\n{mode['label']}\n{LINE}\n"
+            f"🎲 Đánh: <b>{side_label(side)}</b> {'⚫' if side == TAI else '⚪'}\n"
+            f"<pre>"
+            f"Xác suất   {p_side:6.1%}  {bar(p_side)}\n"
+            f"Chắc chắn  {info['post']:6.1%}  {'không chặn' if mode.get('never_skip') else 'ngưỡng ' + format(mode['post'], '.0%')}\n"
+            f"Mẫu hiệu   {info['n_eff']:6.1f}"
+            f"</pre>\n"
             f"{LINE}\n"
-            f"💰 Cược: {fmt(bet)} · {x2}\n"
-            f"✅ Nếu THẮNG: {signed(win_amt)}  (x{WIN_PROFIT:g})\n"
-            f"❌ Nếu THUA: -{fmt(bet * LOSE_LOSS)}  (x{LOSE_LOSS:g})\n"
-            f"📉 Kỳ vọng mỗi lần: {signed(ev_amt)}\n"
+            f"💰 Cược      <b>{fmt(bet)}</b> · {x2}\n"
+            f"✅ Thắng     <b>{signed(bet * WIN_PROFIT)}</b>  x{WIN_PROFIT:g}\n"
+            f"❌ Thua      <b>-{fmt(bet * LOSE_LOSS)}</b>  x{LOSE_LOSS:g}\n"
+            f"📉 Kỳ vọng   {signed(bet * info['ev'])}\n"
             f"{LINE}\n"
-            f"🧠 {info['ctx']}\n"
-            f"🎚️ Chế độ: {mode['label']}\n"
-            f"🧾 10 phiên gần nhất: {recent}")
+            f"🧠 {esc(info['ctx'])}\n"
+            f"ℹ️ {esc(info['reason'])}{extra}\n"
+            f"🧾 {recent}")
 
 
 def result_card(sid, res, pred, bet_done, won, bet, st):
-    head = f"🎲 KẾT QUẢ PHIÊN #{sid}: {side_label(res)}"
+    head = f"🎲 <b>KẾT QUẢ PHIÊN #{sid}: {side_label(res)}</b>"
+    recent = trail(st["engine"].results(), 10) or "—"
     if not bet_done:
-        return f"{head}\n{LINE}\n⏭️ Không đặt cược phiên này\n🧾 {trail(st['engine'].results(), 10)}"
-    verdict = "✅ THẮNG" if won else "❌ THUA"
+        return f"{head}\n{LINE}\n⏭️ Không đặt cược phiên này\n🧾 {recent}"
     delta = bet * WIN_PROFIT if won else -bet * LOSE_LOSS
+    verdict = "✅ <b>THẮNG</b>" if won else "❌ <b>THUA</b>"
     return (f"{head}\n{LINE}\n"
-            f"🎯 Đã đoán: {side_label(pred)} · Cược {fmt(bet)}\n"
-            f"{verdict}  {signed(delta)}\n"
+            f"🎯 Đã đoán {side_label(pred)} · Cược {fmt(bet)}\n"
+            f"{verdict}  <b>{signed(delta)}</b>\n"
             f"{LINE}\n"
-            f"💰 Lợi nhuận phiên: {signed(st['profit'])}\n"
-            f"🔥 Chuỗi thắng: {st['win_streak']} · 💀 Chuỗi thua: {st['lose_streak']}\n"
-            f"🧾 {trail(st['engine'].results(), 10)}")
+            f"<pre>"
+            f"Lợi nhuận phiên   {signed(st['profit'])}\n"
+            f"Chuỗi thắng       {st['win_streak']}\n"
+            f"Chuỗi thua        {st['lose_streak']}"
+            f"</pre>\n"
+            f"🧾 {recent}")
 
 
 def setup_text(st):
@@ -472,56 +480,62 @@ def account_text(cid, st):
             f"🧾 {trail(eng.results(), 10)}")
 
 
-HELP_TEXT = f"""📖 {BOT_NAME} · HƯỚNG DẪN
-Gõ trực tiếp lệnh, có hoặc không dấu đều được.
+COMMAND_LIST = """🔑 <b>KÍCH HOẠT</b>
+<code>/nhapkey MÃ_KEY</code> — Kích hoạt VIP bằng key admin cấp
+🔐 <b>KẾT NỐI</b>
+<code>/dangnhap TK MK</code> — Đăng nhập, nạp lịch sử, chạy ngầm
+<code>/dung</code> — Ngắt kết nối an toàn
+⚡ <b>ĐẶT CƯỢC</b>
+<code>/tudong bat 10k</code> — Bật tự động, mỗi phiên cược 10.000
+<code>/tudong tat</code> — Tắt tự động
+<code>/x2 bat</code> — Thua thì nhân đôi cược, tối đa 6 cấp
+<code>/x2 tat</code> — Tắt X2, về mức gốc
+⚙️ <b>CÀI ĐẶT</b>
+<code>/caidat</code> — Xem cài đặt hiện tại
+<code>/caidat cuoc=10k sl=1m sw=5m limit=50m mode=maohiem thongbao=bat</code> — Đổi nhiều mục cùng lúc
+📊 <b>TÀI KHOẢN</b>
+<code>/thongtin</code> — Số dư, lợi nhuận, độ chính xác
+📖 <b>TRỢ GIÚP</b>
+<code>/batdau</code> — Màn hình này
+<code>/trogiup</code> — Hướng dẫn chi tiết
+👑 <b>ADMIN</b>
+<code>/taokey 30</code> — Tạo key VIP 30 ngày
+<code>/danhsachkey</code> — Xem key chưa dùng"""
 
-🔑 KÍCH HOẠT
-nhapkey MÃ_KEY
-   Kích hoạt VIP bằng key do admin cấp.
-thongtin
-   Xem hạn dùng, số dư, lợi nhuận, độ chính xác.
+HELP_TEXT = f"""📖 <b>{BOT_NAME} · HƯỚNG DẪN CHI TIẾT</b>
+Gõ lệnh bắt đầu bằng dấu /. Phần tham số có dấu hoặc không dấu đều được.
 
-🔐 KẾT NỐI
-dangnhap TÀI_KHOẢN MẬT_KHẨU
-   Đăng nhập, nạp lịch sử và chạy ngầm nạp phiên mới liên tục.
-dung
-   Ngắt kết nối an toàn, tắt tự động và X2.
+🔑 <b>Kích hoạt</b>
+<code>/nhapkey MÃ_KEY</code>: nhập key admin cấp để mở VIP.
 
-⚡ ĐẶT CƯỢC
-tudong bat 10k
-   Bật tự động, mỗi phiên cược 10.000 (viết được 10k, 1m).
-tudong tat
-   Tắt tự động.
-x2 bat
-   Thua thì nhân đôi cược, tối đa 6 cấp. Rủi ro cao, nên đặt dừng lỗ.
-x2 tat
-   Tắt X2, quay về mức gốc.
+🔐 <b>Kết nối</b>
+<code>/dangnhap TÀI_KHOẢN MẬT_KHẨU</code>: đăng nhập, tải lịch sử và chạy ngầm nạp phiên mới mỗi {SYNC_INTERVAL} giây.
+<code>/dung</code>: ngắt kết nối, tắt tự động và X2.
 
-⚙️ CÀI ĐẶT (gộp trong một lệnh, chỉ ghi mục cần đổi)
-caidat cuoc=10k sl=1m sw=5m limit=50m mode=canbang thongbao=bat
-   cuoc: mức cược gốc
-   sl: dừng lỗ khi lỗ đủ số tiền này trong phiên
-   sw: dừng lãi khi lãi đủ số tiền này trong phiên
-   limit: tổng tiền cược tối đa trong một ngày
-   mode: antoan, canbang hoặc maohiem
-   thongbao: bat hoặc tat, bật tắt thông báo từng phiên
-caidat
-   Xem cài đặt hiện tại.
+⚡ <b>Đặt cược</b>
+<code>/tudong bat 10k</code>: bật tự động, mỗi phiên cược 10.000. Viết được 10k hoặc 1m.
+<code>/tudong tat</code>: tắt tự động.
+<code>/x2 bat</code>: thua thì nhân đôi cược cho đến khi thắng, tối đa {MAX_MARTINGALE_LEVEL} cấp.
+<code>/x2 tat</code>: tắt X2.
 
-📐 CÁCH TÍNH
-Thắng: lãi x{WIN_PROFIT} số tiền cược.
-Thua: mất x{LOSE_LOSS} số tiền cược.
-Mỗi phiên bot tính xác suất TÀI, độ chắc chắn và kỳ vọng. Chỉ đánh khi cả hai mô hình cùng đồng thuận và độ chắc chắn vượt ngưỡng của chế độ.
+⚙️ <b>Cài đặt</b>
+<code>/caidat cuoc=10k sl=1m sw=5m limit=50m mode=canbang thongbao=bat</code>
+• cuoc: mức cược gốc
+• sl: dừng khi lỗ đủ số tiền này trong phiên
+• sw: dừng khi lãi đủ số tiền này trong phiên
+• limit: tổng tiền cược tối đa mỗi ngày
+• mode: antoan, canbang hoặc maohiem
+• thongbao: bat hoặc tat, bật tắt thông báo từng phiên
 
-📝 LƯU Ý
-Kết quả Tài/Xỉu về cơ bản là ngẫu nhiên. Bot chỉ bỏ qua phiên thiếu bằng chứng, không đảm bảo thắng.
+🎯 <b>Chế độ</b>
+🟢 antoan: chỉ đánh khi độ chắc chắn từ 97%.
+🟡 canbang: chỉ đánh khi độ chắc chắn từ 92%.
+🔴 maohiem: đánh mọi phiên, không bỏ phiên nào.
 
-👑 ADMIN
-taokey 30
-   Tạo key VIP có hạn số ngày chỉ định.
-danhsachkey
-   Xem các key chưa được sử dụng.
+📐 <b>Tính tiền</b>
+Thắng: lãi x{WIN_PROFIT:g} số tiền cược. Thua: mất x{LOSE_LOSS:g}.
 
+📝 Kết quả Tài/Xỉu về cơ bản là ngẫu nhiên. Bot không đảm bảo thắng.
 📩 Hỗ trợ: {ADMIN_USERNAME}"""
 
 
@@ -589,7 +603,7 @@ def check_auth(chat_id):
 def require_auth(fn):
     def wr(m, *a, **kw):
         if not check_auth(m.chat.id):
-            bot.reply_to(m, f"🔒 CHƯA KÍCH HOẠT\n👉 nhapkey MÃ_KEY\n📩 {ADMIN_USERNAME}")
+            bot.reply_to(m, f"🔒 CHƯA KÍCH HOẠT\n👉 /nhapkey MÃ_KEY\n📩 {ADMIN_USERNAME}")
             return
         return fn(m, *a, **kw)
     return wr
@@ -649,7 +663,7 @@ def start_websocket(cid, token):
         if arr:
             st["engine"].ingest(arr)
             notify(cid, f"🟢 ĐÃ KẾT NỐI · nạp {len(arr)} phiên · bộ nhớ {len(st['engine'].recs)} phiên\n"
-                        f"👉 tudong bat [tiền] để bật tự động", force=True)
+                        f"👉 /tudong bat [tiền] để bật tự động", force=True)
         else:
             notify(cid, "🟢 Đã kết nối · chưa lấy được lịch sử, luồng ngầm sẽ thử lại", force=True)
 
@@ -732,7 +746,7 @@ def start_websocket(cid, token):
                     headers={"User-Agent": "Mozilla/5.0", "Origin": "https://lc79b.bet"})
         sio.wait()
     except Exception as e:
-        notify(cid, f"⚠️ Lỗi WebSocket: {e}", force=True)
+        notify(cid, f"⚠️ Lỗi WebSocket: {esc(e)}", force=True)
 
 
 def stop_user(cid):
@@ -758,28 +772,29 @@ def cmd_batdau(m):
     cid = m.chat.id
     if check_auth(cid):
         han = "👑 QUẢN TRỊ VIÊN VĨNH VIỄN" if cid == ADMIN_ID else format_expire_time(authorized_users[cid])
-        bot.reply_to(m, f"🏠 {BOT_NAME}\n✅ Đã kích hoạt · {han}\n"
-                        f"👉 dangnhap TÀI_KHOẢN MẬT_KHẨU để bắt đầu\n👉 trogiup để xem đầy đủ lệnh")
+        status = f"✅ <b>Đã kích hoạt</b> · {han}"
     else:
-        bot.reply_to(m, f"🏠 {BOT_NAME}\n🔒 Chưa kích hoạt bản quyền\n👉 nhapkey MÃ_KEY\n📩 {ADMIN_USERNAME}")
+        status = "🔒 <b>Chưa kích hoạt</b> · gõ /nhapkey MÃ_KEY"
+    bot.reply_to(m, f"🏠 <b>{BOT_NAME}</b>\n{status}\n{LINE}\n{COMMAND_LIST}\n{LINE}\n"
+                    f"📩 Hỗ trợ: {ADMIN_USERNAME}", parse_mode="HTML")
 
 
 @bot.message_handler(commands=["trogiup", "huongdan"])
 def cmd_trogiup(m):
-    bot.reply_to(m, HELP_TEXT)
+    bot.reply_to(m, HELP_TEXT, parse_mode="HTML")
 
 
 @bot.message_handler(commands=["nhapkey"])
 def cmd_nhapkey(m):
     p = m.text.split()
     if len(p) < 2:
-        return bot.reply_to(m, "👉 Dùng: nhapkey MÃ_KEY")
+        return bot.reply_to(m, "👉 Dùng: /nhapkey MÃ_KEY")
     k = p[1].upper()
     if k in valid_keys:
         authorized_users[m.chat.id] = time.time() + valid_keys[k] * 86400
         del valid_keys[k]
         ht = datetime.fromtimestamp(authorized_users[m.chat.id]).strftime("%d/%m/%Y %H:%M")
-        bot.reply_to(m, f"✅ KÍCH HOẠT VIP THÀNH CÔNG\n📅 Hết hạn: {ht}\n👉 dangnhap TÀI_KHOẢN MẬT_KHẨU để bắt đầu")
+        bot.reply_to(m, f"✅ KÍCH HOẠT VIP THÀNH CÔNG\n📅 Hết hạn: {ht}\n👉 /dangnhap TÀI_KHOẢN MẬT_KHẨU để bắt đầu")
     else:
         bot.reply_to(m, f"❌ KEY KHÔNG HỢP LỆ\n📩 {ADMIN_USERNAME}")
 
@@ -796,7 +811,7 @@ def cmd_taokey(m):
         ht = (datetime.now() + timedelta(days=d)).strftime("%d/%m/%Y %H:%M")
         bot.reply_to(m, f"👑 TẠO KEY THÀNH CÔNG\n🔑 {k}\n⏳ {d} ngày\n📅 Hết hạn: {ht}")
     except ValueError:
-        bot.reply_to(m, "👉 Dùng: taokey 30")
+        bot.reply_to(m, "👉 Dùng: /taokey 30")
 
 
 @bot.message_handler(commands=["danhsachkey"])
@@ -815,7 +830,7 @@ def cmd_dangnhap(m):
     cid = m.chat.id
     p = m.text.split()
     if len(p) != 3:
-        return bot.reply_to(m, "👉 Dùng: dangnhap TÀI_KHOẢN MẬT_KHẨU")
+        return bot.reply_to(m, "👉 Dùng: /dangnhap TÀI_KHOẢN MẬT_KHẨU")
     msg = bot.reply_to(m, "🔄 Đang đăng nhập...")
     res = login_and_get_token(p[1], p[2])
     if "_error" in res:
@@ -829,7 +844,7 @@ def cmd_dangnhap(m):
     gen = st["gen"]
     bot.edit_message_text(f"✅ ĐĂNG NHẬP THÀNH CÔNG\n📛 {res['nickname']}\n💰 Số dư: {fmt(res['money'])}\n"
                           f"🟢 Đang chạy ngầm, nạp phiên mỗi {SYNC_INTERVAL} giây\n"
-                          f"👉 tudong bat [tiền] để bật tự động", cid, msg.message_id)
+                          f"👉 /tudong bat [tiền] để bật tự động", cid, msg.message_id)
     threading.Thread(target=start_websocket, args=(cid, res["token"]), daemon=True).start()
     threading.Thread(target=sync_loop, args=(cid, gen), daemon=True).start()
 
@@ -848,10 +863,10 @@ def cmd_tudong(m):
     st = get_state(cid)
     p = m.text.split()
     if not st["running"]:
-        return bot.reply_to(m, "⚠️ Chưa đăng nhập. Dùng: dangnhap TÀI_KHOẢN MẬT_KHẨU")
+        return bot.reply_to(m, "⚠️ Chưa đăng nhập. Dùng: /dangnhap TÀI_KHOẢN MẬT_KHẨU")
     action = norm(p[1]) if len(p) > 1 else ""
     if action not in ("bat", "tat"):
-        return bot.reply_to(m, "👉 Dùng: tudong bat [tiền] hoặc tudong tat")
+        return bot.reply_to(m, "👉 Dùng: /tudong bat [tiền] hoặc /tudong tat")
 
     if action == "tat":
         st["auto"] = False
@@ -861,18 +876,18 @@ def cmd_tudong(m):
         try:
             st["base_bet"] = parse_amount(p[2])
         except ValueError:
-            return bot.reply_to(m, "❌ Số tiền không hợp lệ. Ví dụ: tudong bat 10k")
+            return bot.reply_to(m, "❌ Số tiền không hợp lệ. Ví dụ: /tudong bat 10k")
     if st["base_bet"] <= 0:
         return bot.reply_to(m, "❌ Mức cược phải lớn hơn 0")
 
     block = risk_block(st, current_bet(st))
     if block:
-        return bot.reply_to(m, f"🛑 Không bật được: {block}. Chỉnh caidat rồi thử lại")
+        return bot.reply_to(m, f"🛑 Không bật được: {block}. Chỉnh /caidat rồi thử lại")
 
     st["auto"] = True
     st["mart_level"] = 0
     bot.reply_to(m, f"🟢 TỰ ĐỘNG ĐÃ BẬT\n💰 {fmt(st['base_bet'])} mỗi phiên · {MODES[st['mode']]['label']}\n"
-                    f"🧠 Chỉ đặt khi thuật toán đủ bằng chứng\n👉 Tắt: tudong tat")
+                    f"🧠 Chỉ đặt khi thuật toán đủ bằng chứng\n👉 Tắt: /tudong tat")
 
 
 @bot.message_handler(commands=["x2"])
@@ -885,7 +900,7 @@ def cmd_x2(m):
     if action not in ("bat", "tat"):
         status = f"BẬT · cấp {st['mart_level']}" if st["martingale"] else "TẮT"
         return bot.reply_to(m, f"💸 X2 KHI THUA\n📌 Trạng thái: {status}\n💰 Gốc: {fmt(st['base_bet'])}\n"
-                               f"🔢 Tối đa: {MAX_MARTINGALE_LEVEL} cấp\n👉 x2 bat hoặc x2 tat")
+                               f"🔢 Tối đa: {MAX_MARTINGALE_LEVEL} cấp\n👉 /x2 bat hoặc /x2 tat")
     st["martingale"] = action == "bat"
     st["mart_level"] = 0
     if st["martingale"]:
@@ -931,7 +946,7 @@ def cmd_caidat(m):
             else:
                 raise ValueError(f"không rõ mục '{k}'")
     except ValueError as e:
-        return bot.reply_to(m, f"❌ {e}\n👉 Ví dụ: caidat cuoc=10k mode=canbang sl=1m")
+        return bot.reply_to(m, f"❌ {e}\n👉 Ví dụ: /caidat cuoc=10k mode=canbang sl=1m")
 
     st.update(updates)
     bot.reply_to(m, "✅ ĐÃ LƯU\n" + setup_text(st))
