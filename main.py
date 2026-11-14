@@ -78,6 +78,22 @@ GAME_ACCOUNTS_FILE = os.path.join(DATA_DIR, "game_accounts.json")
 TELE_SESSION_FILE = os.path.join(DATA_DIR, "tele_session.txt")
 
 
+def md5_hash(t):
+    return hashlib.md5(t.encode()).hexdigest()
+
+
+def normalize_pw(pw, force_mode=None):
+    """Mật khẩu game được gửi dạng MD5. Nếu đã là MD5 (32 ký tự hex) thì giữ nguyên."""
+    pw = pw.strip()
+    if force_mode == "md5":
+        return pw.lower()
+    if force_mode == "plain":
+        return md5_hash(pw)
+    if len(pw) == 32 and all(c in "0123456789abcdef" for c in pw.lower()):
+        return pw.lower()
+    return md5_hash(pw)
+
+
 def load_json(path, default):
     try:
         if os.path.exists(path):
